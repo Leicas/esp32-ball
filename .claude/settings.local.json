@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pip.exe\" install \"littlefs-python==0.12.0\")",
+      "Bash(pio run:*)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\Scripts\\\\pip.exe\" install \"littlefs-python==0.12.0\")",
+      "Bash(where:*)",
+      "Bash(cmd /c \"dir C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\ 2>&1\")",
+      "Bash(cmd /c:*)",
+      "Bash(powershell -Command \"Get-ChildItem ''C:\\\\Users\\\\antoinew\\\\.platformio'' -ErrorAction SilentlyContinue | Select-Object Name\")",
+      "Bash(powershell -Command:*)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\Scripts\\\\pip.exe\" uninstall:*)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" --version)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -v)",
+      "Bash(findstr:*)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pip.exe\" show littlefs-python)",
+      "Bash(.venv/Scripts/pio.exe run:*)",
+      "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -t upload)"
+    ]
+  }
+}
