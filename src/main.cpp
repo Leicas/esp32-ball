@@ -1,40 +1,74 @@
 /*
- * Virtual Rolling Stone — Feather ESP32-C6
+ * Virtual Rolling Stone — Feather ESP32-C6 / CodeCell ESP32-C6 Drive
  *
  * Reproduces the apparatus from:
  *   Yao & Hayward, "An Experiment on Length Perception with a Virtual Rolling Stone"
  *   Eurohaptics 2006, pp. 325-330.
  *
- * Hardware:
- *   BNO085 via STEMMA QT  →  measures tube inclination (replaces ADXL210)
- *   I2S amp + actuator    →  haptic output (replaces custom DAC + coil actuator)
+ * Two build profiles (select via PlatformIO environment):
+ *
+ *   adafruit_feather_esp32c6  (default)
+ *     BNO085 via STEMMA QT  →  measures tube inclination (I2C SDA=IO19 SCL=IO18)
+ *     I2S amp + actuator    →  haptic output  (BCLK=IO21 LRCLK=IO22 DOUT=IO23)
+ *
+ *   codecell_drive  (-DCODECELL_DRIVE)
+ *     CodeCell ESP32-C6 Drive board
+ *     Onboard BNO085 (I2C SDA=IO8 SCL=IO9, managed by CodeCell library)
+ *     Dual H-bridge via DriveCell (members of CodeCell object):
+ *       Drive1: IN1=IO22, IN2=IO21   ← primary haptic actuator
+ *       Drive2: IN1=IO2,  IN2=IO3    ← spare / second actuator
+ *     Rolling haptic : Drive1.Run(smooth, speed%, flip_ms)
+ *                      flip_ms = 15/|v| ms  →  pitch rises with velocity
+ *     Impact haptic  : Drive1.Pulse(direction, 9 ms)
+ *     NOTE: axis orientation depends on board mounting; swap axes in
+ *           Motion_GravityRead()/Motion_LinearAccRead() if the ball rolls the wrong way.
  *
  * Physics (from paper):
  *   Rolling : ẍ = (g/1.4)·sin(α) ≈ 7.0·sin(α)          [Eq. 2]
  *   Sliding : ẍ = g·sin(α) − g·µ·sgn(sin(α))·cos(α)     [Eq. 3]
- *   sin(α) extracted from quaternion: 2·(w·y − x·z)
- *   (gravity component along sensor body-X axis = tube long axis)
+ *   sin(α) = accel_x / g  (gravity + inertia projected on tube axis)
  *
  * Rolling noise synthesis (paper §5.1):
- *   Source: positive arch of sine wave repeated every WTABLE_SIZE mm of travel.
- *   Index : i = pos_mm mod WTABLE_SIZE  (pitch rises naturally with velocity).
- *   Amplitude: proportional to |velocity|.
+ *   Feather : wavetable (negative sine arch, 30-sample period) sampled at
+ *             22 050 Hz; pitch rises naturally with velocity.
+ *   CodeCell: DriveCell.Run() with flip_ms = 15/|v| ms reproduces the same
+ *             pitch-velocity law via the H-bridge driver.
  *
  * Impact synthesis:
- *   One-sample pulse, amplitude ∝ |velocity at wall|.
+ *   Feather : positive rectangular pulse, 8.6 ms, via I2S.
+ *   CodeCell: DriveCell.Pulse() for 9 ms.
  *
- * I2S pins — adjust PIN_I2S_* to match your amp wiring.
+ * Companion app serial protocol:
+ *   Firmware → host (both profiles):
+ *     "$sin_a,x_mm,v_mps\n"  at ~100 Hz (STREAM_INTERVAL_US)
+ *     "# key=val ...\n"       at  1 Hz, and immediately after command replies
+ *   Host → firmware (single ASCII char):
+ *     'r'  ROLLING mode
+ *     's'  SLIDING mode
+ *     '+'  cavity +5 cm  (clamps 10 cm – 200 cm)
+ *     '-'  cavity −5 cm
+ *     '?'  print current parameters
  */
 
 #include <Arduino.h>
+#include <math.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+
+#ifdef CODECELL_DRIVE
+#include <CodeCell.h>
+// Wire, BNO085, NeoPixel, and power management are handled inside CodeCell.
+#else
 #include <Wire.h>
 #include <Adafruit_BNO08x.h>
 #include <Adafruit_NeoPixel.h>
 #include <driver/i2s_std.h>
-#include <math.h>
+#endif
 
-// ── Hardware pins ─────────────────────────────────────────────────────────────
+// ── Hardware pins (Feather only) ──────────────────────────────────────────────
 
+#ifndef CODECELL_DRIVE
 #define BNO08X_RESET -1
 
 static constexpr int PIN_SDA = 19;
@@ -45,68 +79,310 @@ static constexpr int NEO_COUNT = 1;
 
 // I2S output — using SPI header pins (GPIO 4-7 are JTAG on ESP32-C6)
 // Board labels: SCK=IO21  MOSI=IO22  MISO=IO23
-static constexpr gpio_num_t PIN_I2S_BCLK = (gpio_num_t)21;  // SCK  header pin
-static constexpr gpio_num_t PIN_I2S_LRCLK = (gpio_num_t)22; // MOSI header pin
-static constexpr gpio_num_t PIN_I2S_DOUT = (gpio_num_t)23;  // MISO header pin
+static constexpr gpio_num_t PIN_I2S_BCLK = (gpio_num_t)21;
+static constexpr gpio_num_t PIN_I2S_LRCLK = (gpio_num_t)22;
+static constexpr gpio_num_t PIN_I2S_DOUT = (gpio_num_t)23;
+#endif
 
-// ── Physics & audio parameters ────────────────────────────────────────────────
+// ── Physics parameters (shared, fixed) ────────────────────────────────────────
 
-static constexpr uint32_t SAMPLE_RATE = 8000;  // audio/physics rate [Hz]
-static constexpr float H = 1.0f / SAMPLE_RATE; // time step [s]
-static constexpr float G_FACTOR = 7.0f;        // g/1.4 — solid sphere [m/s²]
-static constexpr float D_CAVITY = 1.00f;       // virtual tube length [m]
-static constexpr float FRICTION_MU = 0.20f;    // Coulomb coeff (sliding only)
-static constexpr int WTABLE_SIZE = 30;         // wavetable size [mm per repeat]
-static constexpr int AUDIO_CHUNK = 64;         // frames per I2S write (~8 ms)
-static constexpr float GAIN = 1.00f;           // output amplitude 0–1
+static constexpr float G_FACTOR = 7.0f;     // g/1.4 — solid sphere [m/s²]
+static constexpr float FRICTION_MU = 0.20f; // Coulomb coeff (sliding only)
+static constexpr int WTABLE_SIZE = 30;      // spatial period [mm per repeat]
+static constexpr float RESTITUTION_E = 0.35f; // bounce coefficient (0=no bounce)
+static constexpr float IMPACT_VREF = 1.0f;    // impact amplitude at 1 m/s
 
 // Switch between ROLLING (rolling noise + impact) and SLIDING (impact only).
-// Matches the two experimental conditions in the paper.
 enum class SimMode : uint8_t
 {
     ROLLING,
     SLIDING
 };
-static constexpr SimMode SIM_MODE = SimMode::ROLLING;
+
+// ── Runtime-adjustable simulation parameters ──────────────────────────────────
+// Changed by single-char commands from the companion app (r/s/+/-/?).
+
+static float g_cavity = 1.00f;                // virtual tube length [m]
+static SimMode g_sim_mode = SimMode::ROLLING; // ROLLING or SLIDING
+
+// ── Profile-specific synthesis parameters ─────────────────────────────────────
+
+#ifdef CODECELL_DRIVE
+static constexpr int PHYS_HZ = 100;          // physics update rate [Hz] (CodeCell.Run() caps at 100 Hz)
+static constexpr float H = 1.0f / PHYS_HZ;   // time step [s] = 10 ms
+static constexpr float CC_MIN_SPEED = 0.05f; // m/s — stop actuator below this
+static constexpr int CC_IMPACT_MS = 1;       // impact pulse duration [steps at 100 Hz = 10 ms] → 1 step ≈ 10 ms
+#else
+static constexpr uint32_t SAMPLE_RATE = 22050;
+static constexpr float H = 1.0f / SAMPLE_RATE;
+static constexpr int AUDIO_CHUNK = 128; // frames per I2S write (~5.8 ms)
+static constexpr float GAIN = 1.00f;
+static constexpr int IMPACT_SAMPLES = (int)(0.0086f * SAMPLE_RATE + 0.5f); // 190
+#endif
+
+// ── Companion streaming ────────────────────────────────────────────────────────
+
+static constexpr uint32_t STREAM_INTERVAL_US = 10000; // 100 Hz telemetry to companion app
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 
+#ifdef CODECELL_DRIVE
+CodeCell myCodeCell;
+// myCodeCell.Drive1 (IO22/IO21) and myCodeCell.Drive2 (IO2/IO3) are
+// DriveCell members instantiated by the CodeCell library.
+#else
 Adafruit_NeoPixel pixel(NEO_COUNT, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 Adafruit_BNO08x bno08x(BNO08X_RESET);
 sh2_SensorValue_t sensorValue;
-
 static i2s_chan_handle_t tx_chan = nullptr;
+#endif
 
 // ── Physics state ─────────────────────────────────────────────────────────────
 
-static float x_pos = D_CAVITY / 2.0f; // ball position  [m], starts at centre
-static float x_vel = 0.0f;            // ball velocity  [m/s]
-static float accel_k = 0.0f;          // accel at step k (trapezoidal carry)
-static float sin_alpha = 0.0f;        // gravity component along tube axis
+static float x_pos = 0.50f;      // ball position [m] — half of default 1.0 m cavity
+static float x_vel = 0.0f;       // ball velocity [m/s]
+static float accel_k = 0.0f;     // accel at step k (trapezoidal carry)
+static float sin_alpha = 0.0f;   // sin of tube tilt angle (from gravity vector)
+static float lin_accel_x = 0.0f; // tube linear accel along axis [m/s^2]
 
-// Rolling noise wavetable — positive arch of sine
-static float wtable[WTABLE_SIZE];
+static bool at_left_wall = false;
+static bool at_right_wall = false;
 
-// Drake LFi impact state — sustains the 8.6 ms tick pulse across chunks
-// Datasheet §3.1.1: single tick = +V rectangular pulse, 8.6 ms duration.
-// At 8 kHz that is 69 samples.
-static constexpr int IMPACT_SAMPLES = (int)(0.0086f * SAMPLE_RATE + 0.5f); // 69
-static int impact_left = 0;                                                // samples remaining in current pulse
+// Profile-specific impact / synthesis state
+
+#ifdef CODECELL_DRIVE
+static int cc_impact_left = 0; // cooldown steps remaining (don't call Run/Drive during Pulse)
+#else
+static int impact_left = 0;
 static float impact_amp = 0.0f;
-
-// BNO085 state (updated from sensor events)
-static float qw = 1.0f, qx = 0.0f, qy = 0.0f, qz = 0.0f;
-static float heading_acc = NAN;
-
-// Mono audio buffer
+static float wtable[WTABLE_SIZE];
 static int16_t audio_buf[AUDIO_CHUNK];
+#endif
 
 // Housekeeping
+
+#ifndef CODECELL_DRIVE
 static uint8_t neo_hue = 0;
+#endif
 static uint32_t pkt_cnt = 0;
 static uint32_t last_hz_ms = 0;
+static uint32_t last_stream_us = 0;
 
-// ── NeoPixel helpers ──────────────────────────────────────────────────────────
+// ── BLE GATT server ───────────────────────────────────────────────────────────
+
+static const char *BLE_DEV_NAME = "RollingStone";
+static const char *BLE_SVC_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+static const char *BLE_TELEM_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214";
+static const char *BLE_CMD_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214";
+static const char *BLE_STAT_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214";
+
+static BLEServer *ble_server = nullptr;
+static BLECharacteristic *ble_telem_chr = nullptr;
+static BLECharacteristic *ble_stat_chr = nullptr;
+
+static void handleCommand(char c); // forward declaration
+
+class BleServerCB : public BLEServerCallbacks
+{
+    void onDisconnect(BLEServer *pServer) override
+    {
+        BLEDevice::startAdvertising();
+    }
+};
+
+class BleCmdCB : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *chr) override
+    {
+        String val = chr->getValue();
+        if (val.length() > 0)
+            handleCommand(val.charAt(0));
+    }
+};
+
+static void bleSendStatus()
+{
+    if (!ble_stat_chr)
+        return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s,%.0f",
+             g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+             g_cavity * 1000.0f);
+    ble_stat_chr->setValue(buf);
+    ble_stat_chr->notify();
+}
+
+static void initBLE()
+{
+    BLEDevice::init(BLE_DEV_NAME);
+    ble_server = BLEDevice::createServer();
+    ble_server->setCallbacks(new BleServerCB());
+
+    BLEService *svc = ble_server->createService(BLE_SVC_UUID);
+
+    ble_telem_chr = svc->createCharacteristic(
+        BLE_TELEM_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY);
+
+    BLECharacteristic *cmd_chr = svc->createCharacteristic(
+        BLE_CMD_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    cmd_chr->setCallbacks(new BleCmdCB());
+
+    ble_stat_chr = svc->createCharacteristic(
+        BLE_STAT_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+
+    svc->start();
+
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(BLE_SVC_UUID);
+    adv->setScanResponse(true);
+    BLEDevice::startAdvertising();
+
+    Serial.printf("BLE : advertising as \"%s\"\n", BLE_DEV_NAME);
+}
+
+// ── Serial command handler ─────────────────────────────────────────────────────
+
+static void handleCommand(char c)
+{
+    switch (c)
+    {
+    case 'r':
+        g_sim_mode = SimMode::ROLLING;
+        Serial.println("# mode=ROLLING");
+        bleSendStatus();
+        break;
+    case 's':
+        g_sim_mode = SimMode::SLIDING;
+        Serial.println("# mode=SLIDING");
+        bleSendStatus();
+        break;
+    case '+':
+        g_cavity = fminf(g_cavity + 0.05f, 2.00f);
+        if (x_pos > g_cavity)
+        {
+            x_pos = g_cavity;
+            x_vel = 0.0f;
+            accel_k = 0.0f;
+        }
+        Serial.printf("# cavity_mm=%.0f\n", g_cavity * 1000.0f);
+        bleSendStatus();
+        break;
+    case '-':
+        g_cavity = fmaxf(g_cavity - 0.05f, 0.10f);
+        if (x_pos > g_cavity)
+        {
+            x_pos = g_cavity;
+            x_vel = 0.0f;
+            accel_k = 0.0f;
+        }
+        Serial.printf("# cavity_mm=%.0f\n", g_cavity * 1000.0f);
+        bleSendStatus();
+        break;
+    case '?':
+        Serial.printf("# mode=%s  cavity_mm=%.0f  G=%.1f  mu=%.2f\n",
+                      g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+                      g_cavity * 1000.0f, G_FACTOR, FRICTION_MU);
+        break;
+    }
+}
+
+struct ImpactInfo
+{
+    bool hit;
+    bool left;
+    float speed;
+};
+
+static ImpactInfo physicsStep(float dt)
+{
+    ImpactInfo impact = {false, false, 0.0f};
+
+    // ── Acceleration at current step ──────────────────────────────────────
+    float accel_new;
+    if (g_sim_mode == SimMode::ROLLING)
+    {
+        // Eq. 2: ẍ = (g/1.4)·sin(α)
+        // Tube acceleration acts opposite in the tube frame.
+        accel_new = G_FACTOR * sin_alpha - (G_FACTOR / 9.8f) * lin_accel_x;
+    }
+    else
+    {
+        // Eq. 3: sliding with Coulomb friction.
+        float s = sin_alpha;
+        float c = sqrtf(fmaxf(1.0f - s * s, 0.0f));
+        if (s * s <= FRICTION_MU * FRICTION_MU * (1.0f - s * s))
+            accel_new = 0.0f;
+        else
+            accel_new = 9.8f * s - 9.8f * FRICTION_MU * copysignf(c, s);
+        accel_new -= lin_accel_x;
+    }
+
+    // ── Trapezoidal integration (paper §5.1) ──────────────────────────────
+    float v_new = x_vel + dt * (accel_k + accel_new) * 0.5f;
+    float x_new = x_pos + dt * (x_vel + v_new) * 0.5f;
+    accel_k = accel_new;
+
+    // ── Wall constraint + rebound ─────────────────────────────────────────
+    if (x_new <= 0.0f)
+    {
+        if (v_new < 0.0f)
+        {
+            if (!at_left_wall)
+            {
+                impact.hit = true;
+                impact.left = true;
+                impact.speed = fabsf(v_new);
+                v_new = -RESTITUTION_E * v_new;
+            }
+            else
+            {
+                v_new = 0.0f;
+            }
+        }
+        x_new = 0.0f;
+        at_left_wall = true;
+        at_right_wall = false;
+    }
+    else if (x_new >= g_cavity)
+    {
+        if (v_new > 0.0f)
+        {
+            if (!at_right_wall)
+            {
+                impact.hit = true;
+                impact.left = false;
+                impact.speed = fabsf(v_new);
+                v_new = -RESTITUTION_E * v_new;
+            }
+            else
+            {
+                v_new = 0.0f;
+            }
+        }
+        x_new = g_cavity;
+        at_right_wall = true;
+        at_left_wall = false;
+    }
+    else
+    {
+        at_left_wall = false;
+        at_right_wall = false;
+    }
+
+    x_vel = v_new;
+    x_pos = x_new;
+
+    return impact;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FEATHER-ONLY helpers
+// ══════════════════════════════════════════════════════════════════════════════
+
+#ifndef CODECELL_DRIVE
 
 static void neoSet(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -126,8 +402,6 @@ static void neoBlink(uint8_t r, uint8_t g, uint8_t b, int n, uint32_t ms = 120)
     neoSet(r, g, b);
 }
 
-// ── I2C scan ──────────────────────────────────────────────────────────────────
-
 static void i2cScan()
 {
     Serial.println("Scanning I2C...");
@@ -145,41 +419,24 @@ static void i2cScan()
         Serial.println("  None found.");
 }
 
-// ── BNO085 ────────────────────────────────────────────────────────────────────
-
 static void setReports()
 {
-    // 2500 µs = 400 Hz — full 9-DOF fusion, no yaw drift
-    if (!bno08x.enableReport(SH2_ARVR_STABILIZED_RV, 2500))
-    {
-        Serial.println("Could not enable ARVR stabilized RV");
-    }
+    // Gravity + linear acceleration reports at 1000 Hz.
+    if (!bno08x.enableReport(SH2_GRAVITY, 1000))
+        Serial.println("Could not enable gravity vector");
+    if (!bno08x.enableReport(SH2_LINEAR_ACCELERATION, 1000))
+        Serial.println("Could not enable linear acceleration");
 }
 
-// sin(α) = gravity projected onto body X (tube long axis).
-// Derived from rotation matrix element R[2][0] = 2(xz−wy):
-//   g_body_x = −R[2][0] = 2(wy − xz)
-static inline void updateSinAlpha()
-{
-    sin_alpha = 2.0f * (qw * qy - qx * qz);
-}
-
-// ── Rolling noise wavetable ───────────────────────────────────────────────────
-// Positive arch of sine: sin(π·i/(N−1)) for i ∈ [0, N).
+// Rolling noise wavetable — negative arch of sine.
 // Indexed by ball position in mm, so pitch ∝ velocity — exactly like a real ball.
-
 static void initWavetable()
 {
     // Negative arch: drives hammer into repelling field → blunt "pulse" feel.
     // Keeps rolling sensation soft and distinct from the sharp +V impact tick.
-    // (Datasheet §3.1.1: +V = sharp tick, -V = blunt pulse.)
     for (int i = 0; i < WTABLE_SIZE; i++)
-    {
         wtable[i] = -sinf((float)M_PI * i / (WTABLE_SIZE - 1));
-    }
 }
-
-// ── I2S initialisation ────────────────────────────────────────────────────────
 
 static void initI2S()
 {
@@ -203,88 +460,117 @@ static void initI2S()
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
     Serial.printf("I2S : BCLK=IO%d  LRCLK=IO%d  DOUT=IO%d  %u Hz  OK\n",
-                  (int)PIN_I2S_BCLK, (int)PIN_I2S_LRCLK, (int)PIN_I2S_DOUT,
-                  SAMPLE_RATE);
+                  (int)PIN_I2S_BCLK, (int)PIN_I2S_LRCLK, (int)PIN_I2S_DOUT, SAMPLE_RATE);
 }
 
-// ── Physics + audio synthesis ─────────────────────────────────────────────────
 // Fills audio_buf with AUDIO_CHUNK mono frames.
 // Each sample advances the physics simulation by one step H.
-// Trapezoidal integration matches the paper's finite-difference scheme.
-
 static void fillAudioBuf()
 {
     for (int i = 0; i < AUDIO_CHUNK; i++)
     {
-        // ── Acceleration at current step ──────────────────────────────────────
-        float accel_new;
+        ImpactInfo impact = physicsStep(H);
 
-        if (SIM_MODE == SimMode::ROLLING)
+        if (impact.hit)
         {
-            // Eq. 2: ẍ = (g/1.4)·sin(α)
-            accel_new = G_FACTOR * sin_alpha;
-        }
-        else
-        {
-            // Eq. 3: sliding with Coulomb friction.
-            // Use sgn(sin α) in place of sgn(ẋ) to avoid spurious chattering
-            // (as noted in the paper).
-            float s = sin_alpha;
-            float s2 = s * s;
-            float c = sqrtf(fmaxf(1.0f - s2, 0.0f)); // cos(α) ≥ 0
-
-            // Static friction threshold: tan(α) > µ  ↔  sin²α > µ²·cos²α
-            if (s2 <= FRICTION_MU * FRICTION_MU * (1.0f - s2))
-                accel_new = 0.0f;
-            else
-                accel_new = 9.8f * s - 9.8f * FRICTION_MU * copysignf(c, s);
+            impact_amp = fminf(impact.speed / IMPACT_VREF, 1.0f);
+            impact_left = IMPACT_SAMPLES;
         }
 
-        // ── Trapezoidal integration (paper §5.1) ──────────────────────────────
-        float v_new = x_vel + H * (accel_k + accel_new) * 0.5f;
-        float x_new = x_pos + H * (x_vel + v_new) * 0.5f;
-        accel_k = accel_new;
-
-        // ── Cue synthesis ─────────────────────────────────────────────────────
         float sample_f = 0.0f;
-
-        if (x_new <= 0.0f || x_new >= D_CAVITY)
-        {
-            // Impact: start Drake LFi tick pulse (§3.1.1 — 8.6 ms +V pulse).
-            impact_amp  = 1.0f;
-            impact_left = IMPACT_SAMPLES; // 69 samples @ 8 kHz
-            v_new = 0.0f;
-            x_new = (x_new <= 0.0f) ? 0.0f : D_CAVITY;
-        }
-
         if (impact_left > 0)
         {
-            // Sustain the rectangular tick pulse for its full 8.6 ms duration.
             sample_f = impact_amp;
             impact_left--;
         }
-        else if (SIM_MODE == SimMode::ROLLING)
+        else if (g_sim_mode == SimMode::ROLLING)
         {
-            // Rolling noise: wavetable[pos_mm mod 30], amplitude ∝ speed.
-            // Index advances by (v·1000/SAMPLE_RATE) mm per step, so frequency
-            // rises linearly with velocity — exactly like a real rolling object.
-            int idx = abs((int)(x_new * 1000.0f)) % WTABLE_SIZE;
-            float speed = fminf(fabsf(v_new) / 2.0f, 1.0f);
+            // Wavetable index = pos_mm mod 30; amplitude ∝ speed.
+            int idx = abs((int)(x_pos * 1000.0f)) % WTABLE_SIZE;
+            float speed = fminf(fabsf(x_vel) / 2.0f, 1.0f);
             sample_f = wtable[idx] * speed;
         }
         // (SLIDING without impact → silence between walls, just like the paper)
-
-        x_vel = v_new;
-        x_pos = x_new;
 
         audio_buf[i] = (int16_t)(sample_f * GAIN * 32767.0f);
     }
 }
 
+#endif // !CODECELL_DRIVE
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CODECELL-ONLY: one physics + haptic step, called at PHYS_HZ (1000 Hz)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#ifdef CODECELL_DRIVE
+
+static void ccPhysicsAndHaptic()
+{
+    ImpactInfo impact = physicsStep(H);
+
+    if (impact.hit)
+    {
+        myCodeCell.Drive1.Pulse(!impact.left, CC_IMPACT_MS);
+        cc_impact_left = CC_IMPACT_MS;
+    }
+
+    // ── Haptic output ─────────────────────────────────────────────────────────
+    if (cc_impact_left > 0)
+    {
+        // Pulse() is running its timer — do not call Drive/Run until it finishes.
+        cc_impact_left--;
+    }
+    else if (g_sim_mode == SimMode::ROLLING)
+    {
+        float speed = fabsf(x_vel);
+        if (speed >= CC_MIN_SPEED)
+        {
+            // Same pitch-velocity law as the wavetable:
+            //   spatial period = WTABLE_SIZE mm = 0.030 m
+            //   half-period time = 0.015 m / v → flip_ms = 15 / v  [ms]
+            uint8_t pct = (uint8_t)fminf(speed / 2.0f * 100.0f, 100.0f);
+            uint16_t flip_ms = (uint16_t)fmaxf(fminf(15.0f / speed, 500.0f), 5.0f);
+            myCodeCell.Drive1.Run(true, pct, flip_ms);
+        }
+        else
+        {
+            myCodeCell.Drive1.Drive(false, 0); // ball nearly stopped → quiet
+        }
+    }
+    else
+    {
+        // SLIDING: no rolling noise between wall contacts (matches paper)
+        myCodeCell.Drive1.Drive(false, 0);
+    }
+}
+
+#endif // CODECELL_DRIVE
+
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 void setup()
 {
+    Serial.begin(115200);
+
+#ifdef CODECELL_DRIVE
+    // CodeCell.Init() starts Wire(IO8, IO9), configures power management,
+    // initialises the onboard BNO085, and sets up the status LED.
+    myCodeCell.Init(MOTION_GRAVITY | MOTION_LINEAR_ACC);
+    myCodeCell.Drive1.Init();
+    // Drive2 (IO2/IO3) is available for a second actuator if needed.
+
+    delay(500); // let serial settle after USB-CDC init
+
+    Serial.println("\n================================");
+    Serial.println("Virtual Rolling Stone  —  CodeCell ESP32-C6 Drive");
+    Serial.println("================================");
+    Serial.printf("# mode=%s  cavity_mm=%.0f  G=%.1f  mu=%.2f\n",
+                  g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+                  g_cavity * 1000.0f, G_FACTOR, FRICTION_MU);
+    Serial.printf("# Output: H-bridge Drive1 (IO22/IO21)  phys=%d Hz  stream=%lu Hz\n",
+                  PHYS_HZ, 1000000UL / STREAM_INTERVAL_US);
+
+#else
     pinMode(PIN_STEMMA_POWER, OUTPUT);
     digitalWrite(PIN_STEMMA_POWER, HIGH); // power STEMMA QT + NeoPixel
 
@@ -292,7 +578,6 @@ void setup()
     pixel.setBrightness(40);
     neoBlink(255, 255, 255, 3); // WHITE: firmware alive
 
-    Serial.begin(115200);
     delay(1000);
 
     Serial.println("\n================================");
@@ -300,7 +585,6 @@ void setup()
     Serial.println("================================");
 
     initWavetable();
-
     initI2S();
 
     Wire.begin(PIN_SDA, PIN_SCL);
@@ -322,18 +606,77 @@ void setup()
 
     setReports();
 
-    Serial.printf("Physics: cavity=%.0f cm  mode=%s  G=%.1f  mu=%.2f\n",
-                  D_CAVITY * 100.0f,
-                  SIM_MODE == SimMode::ROLLING ? "rolling" : "sliding",
-                  G_FACTOR, FRICTION_MU);
+    Serial.printf("# mode=%s  cavity_mm=%.0f  G=%.1f  mu=%.2f\n",
+                  g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+                  g_cavity * 1000.0f, G_FACTOR, FRICTION_MU);
+    Serial.printf("# Output: I2S %u Hz  stream=%lu Hz\n",
+                  SAMPLE_RATE, 1000000UL / STREAM_INTERVAL_US);
     delay(100);
+#endif
+
+    initBLE();
+
+    last_hz_ms = millis();
+    last_stream_us = micros();
 }
 
 // ── loop ──────────────────────────────────────────────────────────────────────
 
 void loop()
 {
-    // 1. Read BNO085 — drain up to 8 pending events, keep latest quaternion
+    // ── Serial commands from companion app ────────────────────────────────────
+    while (Serial.available())
+        handleCommand((char)Serial.read());
+
+#ifdef CODECELL_DRIVE
+    // myCodeCell.Run(Hz) returns true at the requested rate and handles
+    // sensor polling, power management, and LED updates internally.
+    if (myCodeCell.Run((uint8_t)PHYS_HZ))
+    {
+        // Gravity vector gives tilt; linear accel gives tube shake along axis.
+        float gx, gy, gz;
+        float lax, lay, laz;
+        myCodeCell.Motion_GravityRead(gx, gy, gz);
+        myCodeCell.Motion_LinearAccRead(lax, lay, laz);
+        sin_alpha = fmaxf(-1.0f, fminf(1.0f, gx / 9.8f));
+        lin_accel_x = lax;
+        pkt_cnt++;
+
+        ccPhysicsAndHaptic();
+
+        uint32_t now = millis();
+
+        // Stream telemetry to companion app at 100 Hz
+        uint32_t now_us = micros();
+        if (now_us - last_stream_us >= STREAM_INTERVAL_US)
+        {
+            Serial.printf("$%+.4f,%.1f,%+.4f\n",
+                          sin_alpha, x_pos * 1000.0f, x_vel);
+            if (ble_server->getConnectedCount() > 0)
+            {
+                float pkt[3] = {sin_alpha, x_pos * 1000.0f, x_vel};
+                ble_telem_chr->setValue((uint8_t *)pkt, sizeof(pkt));
+                ble_telem_chr->notify();
+            }
+            last_stream_us = now_us;
+        }
+
+        // 1 Hz debug line
+        if (now - last_hz_ms >= 1000)
+        {
+            float phys_hz = pkt_cnt * 1000.0f / (float)(now - last_hz_ms);
+            Serial.printf("# sin_a=%+.3f  x_mm=%.1f  v_mps=%+.4f  hz=%.0f"
+                          "  mode=%s  cavity_mm=%.0f\n",
+                          sin_alpha, x_pos * 1000.0f, x_vel, phys_hz,
+                          g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+                          g_cavity * 1000.0f);
+            pkt_cnt = 0;
+            last_hz_ms = now;
+        }
+    }
+
+#else
+    // 1. Read BNO085 — drain up to 8 pending events
     if (bno08x.wasReset())
     {
         Serial.println("# sensor reset — re-enabling");
@@ -342,51 +685,63 @@ void loop()
     }
     for (int n = 0; n < 8 && bno08x.getSensorEvent(&sensorValue); n++)
     {
-        if (sensorValue.sensorId == SH2_ARVR_STABILIZED_RV)
+        if (sensorValue.sensorId == SH2_GRAVITY)
         {
-            qw = sensorValue.un.arvrStabilizedRV.real;
-            qx = sensorValue.un.arvrStabilizedRV.i;
-            qy = sensorValue.un.arvrStabilizedRV.j;
-            qz = sensorValue.un.arvrStabilizedRV.k;
-            heading_acc = sensorValue.un.arvrStabilizedRV.accuracy;
-            updateSinAlpha();
+            float gx = sensorValue.un.gravity.x;
+            sin_alpha = fmaxf(-1.0f, fminf(1.0f, gx / 9.8f));
             pkt_cnt++;
+        }
+        else if (sensorValue.sensorId == SH2_LINEAR_ACCELERATION)
+        {
+            lin_accel_x = sensorValue.un.linearAcceleration.x;
         }
     }
 
-    // 2. NeoPixel: magnetometer calibration quality
-    if (isnan(heading_acc) || heading_acc > 1.0f)
-        neoSet(200, 0, 0); // RED   — poor  (>57°)
-    else if (heading_acc > 0.35f)
-        neoSet(255, 100, 0); // ORANGE — medium (20–57°)
-    else
+    // 2. NeoPixel: cycle hue while running (indicates activity)
     {
         uint32_t c = pixel.ColorHSV((uint16_t)(neo_hue++) * 256, 255, 180);
         pixel.setPixelColor(0, c);
-        pixel.show(); // BLUE cycling — good (<20°)
+        pixel.show();
     }
 
     // 3. Run physics simulation + generate audio samples
     fillAudioBuf();
 
-    // 4. Push to I2S DMA (blocks ~8 ms in steady state — natural rate limiter)
+    // 4. Stream telemetry to companion app at 100 Hz
+    {
+        uint32_t now = millis();
+        uint32_t now_us = micros();
+        if (now_us - last_stream_us >= STREAM_INTERVAL_US)
+        {
+            Serial.printf("$%+.4f,%.1f,%+.4f\n",
+                          sin_alpha, x_pos * 1000.0f, x_vel);
+            if (ble_server->getConnectedCount() > 0)
+            {
+                float pkt[3] = {sin_alpha, x_pos * 1000.0f, x_vel};
+                ble_telem_chr->setValue((uint8_t *)pkt, sizeof(pkt));
+                ble_telem_chr->notify();
+            }
+            last_stream_us = now_us;
+        }
+    }
+
+    // 5. Push to I2S DMA (blocks ~8 ms in steady state — natural rate limiter)
     size_t written;
     i2s_channel_write(tx_chan, audio_buf, sizeof(audio_buf),
                       &written, pdMS_TO_TICKS(100));
 
-    // 5. Debug output — once per second
+    // 6. 1 Hz debug line (includes mode + cavity for companion app)
     uint32_t now = millis();
     if (now - last_hz_ms >= 1000)
     {
         float sensor_hz = pkt_cnt * 1000.0f / (float)(now - last_hz_ms);
-        Serial.printf("# sin_a=%+.3f  x=%5.1f mm  v=%+6.3f m/s"
-                      "  cal=%.0f°  imu=%.0f Hz\n",
-                      sin_alpha,
-                      x_pos * 1000.0f,
-                      x_vel,
-                      isnan(heading_acc) ? 999.f : heading_acc * 57.296f,
-                      sensor_hz);
+        Serial.printf("# sin_a=%+.3f  x_mm=%.1f  v_mps=%+.4f  hz=%.0f"
+                      "  mode=%s  cavity_mm=%.0f\n",
+                      sin_alpha, x_pos * 1000.0f, x_vel, sensor_hz,
+                      g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+                      g_cavity * 1000.0f);
         pkt_cnt = 0;
         last_hz_ms = now;
     }
+#endif
 }

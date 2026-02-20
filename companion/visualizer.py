@@ -1,19 +1,44 @@
 #!/usr/bin/env python3
 """
-BNO085 Orientation Visualizer
-Reads quaternion data from the Feather ESP32-C6 over serial and renders a
-live 3D view of sensor orientation along with roll/pitch/yaw readout and
-a compass rose showing magnetic north.
+Rolling Stone Visualizer  —  BLE & USB edition
+
+Connects to the ESP32-C6 "RollingStone" device over BLE or USB serial
+and renders a live view of the virtual tube with the rolling ball, plus
+scrolling traces and optional audio output.
+
+Transport selection (positional argument):
+    Omitted               auto-scan BLE for "RollingStone"
+    COM3 or /dev/ttyACM0  USB serial  ($sin_a,x_mm,v_mps  /  # key=val protocol)
+    AA:BB:CC:DD:EE:FF     BLE direct address
+
+BLE GATT layout (firmware):
+    Service  UUID : 19b10000-e8f2-537e-4f6c-d104768a1214
+    Telemetry     : 19b10001-...  NOTIFY   float32[3]: sin_alpha, x_mm, v_mps
+    Command       : 19b10002-...  WRITE    1 ASCII byte: r/s/+/-/?
+    Status        : 19b10003-...  READ+NOTIFY  ASCII "MODE,cavity_mm"
+
+Audio synthesis:
+    Replicates the Feather firmware rolling-noise wavetable in Python.
+    Same position-indexed negative-arch model, same pitch–velocity law.
+    Toggle with the "♪ Play audio" checkbox (requires sounddevice).
 
 Usage:
-    python visualizer.py COM3          # Windows
-    python visualizer.py /dev/ttyACM0  # Linux / macOS
-    python visualizer.py --list        # list available ports
+    python visualizer.py                   # BLE auto-scan
+    python visualizer.py AA:BB:CC:DD:EE:FF # BLE direct
+    python visualizer.py COM3              # USB serial (Windows)
+    python visualizer.py /dev/ttyACM0      # USB serial (Linux/macOS)
+    python visualizer.py --list            # list serial ports + BLE devices
+    python visualizer.py --baud 921600 COM4
 """
 
 import argparse
+import asyncio
+import collections
 import math
+import queue
+import struct
 import sys
+import threading
 import time
 
 import numpy as np
@@ -22,408 +47,652 @@ import serial.tools.list_ports
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from mpl_toolkits.mplot3d import Axes3D          # noqa: F401 (registers projection)
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.patches as mpatches
+from matplotlib.widgets import CheckButtons
+from bleak import BleakClient, BleakScanner
+
+try:
+    import sounddevice as sd
+    _AUDIO_OK = True
+except ImportError:
+    _AUDIO_OK = False
+    print("sounddevice not found — audio disabled  (pip install sounddevice)")
 
 
 # ---------------------------------------------------------------------------
-# Quaternion math
+# BLE UUIDs
 # ---------------------------------------------------------------------------
 
-def quat_to_matrix(w: float, x: float, y: float, z: float) -> np.ndarray:
-    """Unit quaternion (w, x, y, z) → 3×3 rotation matrix."""
-    return np.array([
-        [1 - 2*(y*y + z*z),   2*(x*y - w*z),       2*(x*z + w*y)],
-        [2*(x*y + w*z),        1 - 2*(x*x + z*z),   2*(y*z - w*x)],
-        [2*(x*z - w*y),        2*(y*z + w*x),        1 - 2*(x*x + y*y)],
-    ])
-
-
-def quat_to_euler_deg(w: float, x: float, y: float, z: float):
-    """Quaternion → (roll, pitch, yaw) in degrees (ZYX / aerospace convention)."""
-    roll  = np.degrees(np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y)))
-    pitch = np.degrees(np.arcsin(np.clip(2*(w*y - z*x), -1.0, 1.0)))
-    yaw   = np.degrees(np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z)))
-    return roll, pitch, yaw
+DEVICE_NAME = "RollingStone"
+SVC_UUID    = "19b10000-e8f2-537e-4f6c-d104768a1214"
+TELEM_UUID  = "19b10001-e8f2-537e-4f6c-d104768a1214"
+CMD_UUID    = "19b10002-e8f2-537e-4f6c-d104768a1214"
+STAT_UUID   = "19b10003-e8f2-537e-4f6c-d104768a1214"
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Audio constants  (matches Feather firmware synthesis)
 # ---------------------------------------------------------------------------
 
-def box_faces(R: np.ndarray, size=(2.0, 1.0, 0.4)):
-    """Return the 6 faces of a box (default PCB-ish shape) rotated by R."""
-    sx, sy, sz = (s / 2 for s in size)
-    corners = np.array([
-        [-sx, -sy, -sz], [ sx, -sy, -sz], [ sx,  sy, -sz], [-sx,  sy, -sz],
-        [-sx, -sy,  sz], [ sx, -sy,  sz], [ sx,  sy,  sz], [-sx,  sy,  sz],
-    ])
-    c = (R @ corners.T).T
-    return [
-        [c[0], c[1], c[2], c[3]],  # -Z face
-        [c[4], c[5], c[6], c[7]],  # +Z face
-        [c[0], c[1], c[5], c[4]],  # -Y face
-        [c[3], c[2], c[6], c[7]],  # +Y face
-        [c[0], c[3], c[7], c[4]],  # -X face
-        [c[1], c[2], c[6], c[5]],  # +X face
-    ]
+_SAMPLE_RATE    = 22050
+_WTABLE_SIZE    = 30
+_IMPACT_SAMPLES = int(0.0086 * _SAMPLE_RATE + 0.5)  # ≈ 190 samples = 8.6 ms
+_IMPACT_VREF    = 1.0  # impact amplitude at 1 m/s
+_AUDIO_GAIN     = 0.6   # overall output level
+
+# Negative-arch wavetable: -sin(π·i / (N-1))
+_WTABLE = (
+    -np.sin(np.pi * np.arange(_WTABLE_SIZE, dtype=np.float32) / (_WTABLE_SIZE - 1))
+).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Colours
+# Colours  (same palette as the orientation visualizer)
 # ---------------------------------------------------------------------------
 
-DARK_BG      = "#1a1a2e"
-PANEL_BG     = "#16213e"
-INFO_BG      = "#0f3460"
-C_RED        = "#e94560"
-C_GREEN      = "#0f9b58"
-C_BLUE       = "#4f8ef7"
-C_TEXT       = "#dce3f0"
-C_MUTED      = "#6a7490"
-C_NORTH      = "#e8e8ff"   # magnetic-north arrow colour
-
-
-def _accuracy_colour(acc_rad: float) -> tuple[str, str]:
-    """Return (cone_fill, label) colour based on heading accuracy in radians."""
-    if math.isnan(acc_rad) or acc_rad > 1.0:
-        return "#e94560", "poor"       # red  — >57°
-    if acc_rad > 0.35:
-        return "#ff8c00", "medium"     # orange — 20–57°
-    return "#00c8a0", "good"           # teal/green — <20°
+DARK_BG  = "#1a1a2e"
+PANEL_BG = "#16213e"
+INFO_BG  = "#0f3460"
+C_RED    = "#e94560"
+C_GREEN  = "#0f9b58"
+C_BLUE   = "#4f8ef7"
+C_TEXT   = "#dce3f0"
+C_MUTED  = "#6a7490"
+C_TUBE   = "#2a3a4a"
+C_WALL   = "#3a5060"
 
 
 # ---------------------------------------------------------------------------
 # Visualizer
 # ---------------------------------------------------------------------------
 
+HISTORY = 200  # data-points kept in the scrolling traces
+
+
 class Visualizer:
-    def __init__(self, port: str, baud: int = 115200):
-        self.ser = serial.Serial(port, baud, timeout=0.02)
+    def __init__(self, target: str | None, baud: int = 115200):
+        # ── Transport detection ────────────────────────────────────────────
+        if target and (target.upper().startswith("COM") or target.startswith("/dev/")):
+            self._mode = "serial"
+        else:
+            self._mode = "ble"
+        self._target = target
+        self._baud   = baud
 
-        # Current state
-        self.quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
-        self.accuracy_rad: float = float("nan")
+        # ── Connection state ───────────────────────────────────────────────
+        self._connected:   bool = False
+        self._conn_label:  str  = ""          # "USB" or "BLE"
+        self._ble_client:  BleakClient | None = None
+        self._ble_loop:    asyncio.AbstractEventLoop | None = None
+        self._cmd_q:       queue.SimpleQueue = queue.SimpleQueue()
 
-        # Frequency counter (1-second sliding window)
+        # ── Physics state ──────────────────────────────────────────────────
+        self.sin_alpha:  float = 0.0
+        self.x_mm:       float = 500.0
+        self.v_mps:      float = 0.0
+        self.cavity_mm:  float = 1000.0
+        self.mode:       str   = "ROLLING"
+
+        self._x_hist = collections.deque([500.0] * HISTORY, maxlen=HISTORY)
+        self._v_hist = collections.deque([0.0]   * HISTORY, maxlen=HISTORY)
+
         self._pkt_count: int   = 0
-        self._hz_t0: float     = time.monotonic()
-        self._hz: float        = 0.0
+        self._hz_t0:     float = time.monotonic()
+        self._hz:        float = 0.0
 
+        self._flash_left:  int   = 0
+        self._flash_right: int   = 0
+        self._prev_x_mm:   float = 500.0
+
+        # ── Audio state ────────────────────────────────────────────────────
+        # Written by telemetry thread + audio callback; GIL makes float
+        # assignments atomic in CPython, so no explicit lock needed.
+        self._aud_play:   bool  = False
+        self._aud_x:      float = 500.0   # extrapolated position [mm]
+        self._aud_v:      float = 0.0     # velocity [m/s]
+        self._aud_impact: int   = 0       # remaining impact samples
+        self._aud_impact_amp: float = 1.0
+        self._stream             = None
+
+        # ── Start threads ──────────────────────────────────────────────────
+        threading.Thread(target=self._transport_main, daemon=True).start()
+        self._start_audio()
         self._build_figure()
 
     # ------------------------------------------------------------------
+    # Shared telemetry + status updates  (called from transport thread)
+    # ------------------------------------------------------------------
+
+    def _on_telem(self, sa: float, xmm: float, vmps: float):
+        if xmm < 8.0 and self._prev_x_mm >= 8.0:
+            self._flash_left  = 8
+            self._aud_impact  = _IMPACT_SAMPLES
+            self._aud_impact_amp = min(abs(vmps) / _IMPACT_VREF, 1.0)
+        if xmm > self.cavity_mm - 8.0 and self._prev_x_mm <= self.cavity_mm - 8.0:
+            self._flash_right = 8
+            self._aud_impact  = _IMPACT_SAMPLES
+            self._aud_impact_amp = min(abs(vmps) / _IMPACT_VREF, 1.0)
+        self._prev_x_mm = xmm
+        self.sin_alpha  = sa
+        self.x_mm       = xmm
+        self.v_mps      = vmps
+        self._aud_x     = xmm
+        self._aud_v     = vmps
+        self._x_hist.append(xmm)
+        self._v_hist.append(vmps)
+        self._pkt_count += 1
+
+    def _on_status(self, mode: str | None, cavity_mm: float | None):
+        if mode:
+            self.mode = mode
+        if cavity_mm is not None:
+            self.cavity_mm = cavity_mm
+
+    def _parse_line(self, line: str):
+        """Parse one telemetry or status line from the serial stream."""
+        if not line:
+            return
+        if line.startswith("$"):
+            parts = line[1:].split(",")
+            if len(parts) == 3:
+                try:
+                    self._on_telem(*map(float, parts))
+                except ValueError:
+                    pass
+        elif line.startswith("#"):
+            mode = None
+            cav  = None
+            for tok in line[1:].split():
+                k, _, v = tok.partition("=")
+                if k == "mode" and v in ("ROLLING", "SLIDING"):
+                    mode = v
+                elif k == "cavity_mm":
+                    try:
+                        cav = float(v)
+                    except ValueError:
+                        pass
+            self._on_status(mode, cav)
+
+    # ------------------------------------------------------------------
+    # Transport dispatcher
+    # ------------------------------------------------------------------
+
+    def _transport_main(self):
+        if self._mode == "serial":
+            self._serial_loop()
+        else:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._ble_loop = loop
+            loop.run_until_complete(self._ble_main())
+
+    # ------------------------------------------------------------------
+    # Serial transport
+    # ------------------------------------------------------------------
+
+    def _serial_loop(self):
+        while True:
+            try:
+                ser = serial.Serial(self._target, self._baud, timeout=0.05)
+                self._connected  = True
+                self._conn_label = "USB"
+                print(f"Connected to {self._target} @ {self._baud} baud")
+                ser.write(b"?")  # request current params
+                while True:
+                    # Drain command queue → serial
+                    while True:
+                        try:
+                            ser.write(self._cmd_q.get_nowait())
+                        except queue.Empty:
+                            break
+                    raw = ser.readline()
+                    if raw:
+                        self._parse_line(raw.decode("ascii", errors="ignore").strip())
+            except Exception as exc:
+                print(f"Serial: {exc}")
+                self._connected = False
+            time.sleep(2.0)
+
+    # ------------------------------------------------------------------
+    # BLE transport
+    # ------------------------------------------------------------------
+
+    async def _ble_main(self):
+        while True:
+            try:
+                await self._ble_connect_loop()
+            except Exception as exc:
+                print(f"BLE error: {exc}")
+            self._connected = False
+            await asyncio.sleep(2.0)
+
+    async def _ble_connect_loop(self):
+        address = self._target
+        if address is None:
+            print(f"Scanning for '{DEVICE_NAME}' …")
+            device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
+            if device is None:
+                print("Not found, retrying …")
+                return
+            address = device.address
+            print(f"Found {DEVICE_NAME} at {address}")
+
+        async with BleakClient(
+            address, disconnected_callback=self._on_ble_disconnect
+        ) as client:
+            self._ble_client = client
+            self._connected  = True
+            self._conn_label = "BLE"
+            print(f"BLE connected to {address}")
+
+            stat = await client.read_gatt_char(STAT_UUID)
+            self._on_ble_status(None, stat)
+
+            await client.start_notify(TELEM_UUID, self._on_ble_telem)
+            await client.start_notify(STAT_UUID,  self._on_ble_status)
+
+            # Poll queued commands at 20 Hz
+            while client.is_connected:
+                while True:
+                    try:
+                        cmd = self._cmd_q.get_nowait()
+                        await client.write_gatt_char(CMD_UUID, cmd, response=False)
+                    except queue.Empty:
+                        break
+                await asyncio.sleep(0.05)
+
+        self._ble_client = None
+        self._connected  = False
+
+    def _on_ble_disconnect(self, _client):
+        self._connected  = False
+        self._ble_client = None
+        print("BLE disconnected — reconnecting …")
+
+    def _on_ble_telem(self, _sender, data: bytearray):
+        if len(data) >= 12:
+            self._on_telem(*struct.unpack_from("<fff", data))
+
+    def _on_ble_status(self, _sender, data: bytearray):
+        try:
+            text  = bytes(data).decode("ascii").strip()
+            parts = text.split(",")
+            mode  = parts[0] if parts and parts[0] in ("ROLLING", "SLIDING") else None
+            cav   = float(parts[1]) if len(parts) >= 2 else None
+            self._on_status(mode, cav)
+        except (ValueError, UnicodeDecodeError):
+            pass
+
+    # ------------------------------------------------------------------
+    # Commands  (thread-safe: all writes go through the queue)
+    # ------------------------------------------------------------------
+
+    def _send_cmd(self, cmd: bytes):
+        self._cmd_q.put(cmd)
+
+    # ------------------------------------------------------------------
+    # Audio synthesis  (runs in sounddevice C thread at _SAMPLE_RATE Hz)
+    # ------------------------------------------------------------------
+
+    def _start_audio(self):
+        if not _AUDIO_OK:
+            return
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=self._audio_cb,
+                blocksize=256,
+            )
+            self._stream.start()
+        except Exception as exc:
+            print(f"Audio: {exc} — disabled")
+            self._stream = None
+
+    def _audio_cb(self, outdata, frames, time_info, status):
+        # Atomic reads via GIL (CPython float/int assignment is pointer-sized)
+        v    = self._aud_v      # m/s
+        x0   = self._aud_x     # mm
+        play = self._aud_play
+        imp  = self._aud_impact
+        imp_amp = self._aud_impact_amp
+
+        # Always advance position estimate so audio is seamless when re-enabled
+        self._aud_x = x0 + v * 1000.0 * (frames / _SAMPLE_RATE)
+
+        if not play:
+            outdata.fill(0)
+            return
+
+        # Vectorised rolling noise: wavetable indexed by ball position in mm,
+        # so pitch rises naturally with velocity — same law as the firmware.
+        t_arr   = np.arange(frames, dtype=np.float32) / _SAMPLE_RATE
+        x_arr   = x0 + v * 1000.0 * t_arr          # mm, per sample
+        idx_arr = np.abs(x_arr.astype(np.int32)) % _WTABLE_SIZE
+        speed   = float(np.clip(abs(v) / 2.0, 0.0, 1.0))
+        buf     = _WTABLE[idx_arr] * speed
+
+        # Impact pulse overlay (rectangular, same 8.6 ms duration as firmware)
+        if imp > 0:
+            n = min(imp, frames)
+            buf[:n] = imp_amp
+            self._aud_impact = max(imp - frames, 0)
+
+        outdata[:] = (buf * _AUDIO_GAIN).reshape(-1, 1)
+
+    def _on_audio_toggle(self, _label):
+        self._aud_play = not self._aud_play
+        if self._aud_play:
+            # Sync position on enable to avoid a startup click
+            self._aud_x = self.x_mm
+            self._aud_v = self.v_mps
+
+    # ------------------------------------------------------------------
+    # Figure layout
+    # ------------------------------------------------------------------
+
     def _build_figure(self):
         matplotlib.rcParams["toolbar"] = "None"
         self.fig = plt.figure(figsize=(13, 8), facecolor=DARK_BG)
 
-        # Main 3D axes — leave the right ~25 % for the compass rose
-        self.ax = self.fig.add_axes([0.00, 0.00, 0.74, 1.00],
-                                    projection="3d", facecolor=PANEL_BG)
-        for spine in self.ax.spines.values():
-            spine.set_visible(False)
+        self.ax = self.fig.add_axes([0.01, 0.12, 0.70, 0.80], facecolor=PANEL_BG)
 
         self.fig.suptitle(
-            "BNO085  ·  ESP32-C6  ·  Rotation Vector (accel + gyro + mag)",
-            color=C_TEXT, fontsize=13, y=0.97,
+            "Virtual Rolling Stone  ·  ESP32-C6  ·  Yao & Hayward, Eurohaptics 2006",
+            color=C_TEXT, fontsize=12, y=0.97,
         )
 
-        # Info text overlay (bottom-left)
         self.info = self.fig.text(
-            0.01, 0.02, "",
+            0.01, 0.01, "",
             color=C_TEXT, fontsize=10, fontfamily="monospace",
             verticalalignment="bottom",
             bbox=dict(facecolor=INFO_BG, alpha=0.85, edgecolor="none", pad=7),
         )
 
-        # Compass rose inset (top-right panel)
-        self.ax_compass = self.fig.add_axes(
-            [0.74, 0.30, 0.24, 0.55],
-            facecolor=PANEL_BG,
+        self.fig.text(
+            0.73, 0.01,
+            "[r] Rolling  [s] Sliding\n[+] longer   [-] shorter  [q] Quit",
+            color=C_MUTED, fontsize=8, fontfamily="monospace", ha="left", va="bottom",
         )
-        self.ax_compass.set_aspect("equal")
-        self.ax_compass.axis("off")
 
-        self.fig.canvas.mpl_connect("close_event", lambda _: self.ser.close())
+        # Right column: position (top), velocity (middle), audio checkbox (bottom)
+        self.ax_pos = self.fig.add_axes([0.74, 0.57, 0.24, 0.34], facecolor=PANEL_BG)
+        self.ax_vel = self.fig.add_axes([0.74, 0.23, 0.24, 0.28], facecolor=PANEL_BG)
 
-    # ------------------------------------------------------------------
-    def _drain_serial(self):
-        """Consume all waiting bytes; keep the most recent valid quaternion."""
-        try:
-            while self.ser.in_waiting:
-                raw = self.ser.readline()
-                line = raw.decode("ascii", errors="ignore").strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split(",")
-                if len(parts) != 5:
-                    continue
-                w, x, y, z, acc = map(float, parts)
-                norm = np.sqrt(w*w + x*x + y*y + z*z)
-                if norm < 0.5:           # ignore obviously bad packets
-                    continue
-                self.quat = (w / norm, x / norm, y / norm, z / norm)
-                self.accuracy_rad = acc
-                self._pkt_count += 1
-        except (ValueError, UnicodeDecodeError, serial.SerialException):
-            pass
+        ax_chk = self.fig.add_axes([0.74, 0.12, 0.24, 0.08], facecolor=PANEL_BG)
+        for sp in ax_chk.spines.values():
+            sp.set_visible(False)
+        ax_chk.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+        if _AUDIO_OK and self._stream is not None:
+            self._chk = CheckButtons(
+                ax_chk, ["♪  Play audio"], actives=[False],
+                label_props={
+                    "color":      [C_TEXT],
+                    "fontsize":   [9],
+                    "fontfamily": ["monospace"],
+                },
+                frame_props={
+                    "edgecolor": [C_MUTED],
+                    "facecolor": [PANEL_BG],
+                    "linewidth": [1.2],
+                },
+                check_props={"color": [C_GREEN]},
+            )
+            self._chk.on_clicked(self._on_audio_toggle)
+        else:
+            ax_chk.text(
+                0.08, 0.5, "♪  audio unavailable",
+                color=C_MUTED, fontsize=9, fontfamily="monospace",
+                va="center", transform=ax_chk.transAxes,
+            )
+
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
+    def _on_close(self, _event):
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+
+    def _on_key(self, event):
+        cmd = {"r": b"r", "s": b"s", "+": b"+", "=": b"+", "-": b"-"}.get(event.key)
+        if cmd:
+            self._send_cmd(cmd)
+        elif event.key == "q":
+            plt.close("all")
+            sys.exit(0)
 
     # ------------------------------------------------------------------
     def _draw_frame(self):
         ax = self.ax
-        w, x, y, z = self.quat
-        R = quat_to_matrix(w, x, y, z)
-
         ax.cla()
-        lim = 1.6
-        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
         ax.set_facecolor(PANEL_BG)
-        ax.set_xlabel("X", color=C_MUTED, labelpad=2)
-        ax.set_ylabel("Y", color=C_MUTED, labelpad=2)
-        ax.set_zlabel("Z", color=C_MUTED, labelpad=2)
-        ax.tick_params(colors=C_MUTED, labelsize=7)
-        ax.set_box_aspect((1, 1, 1))
+        ax.axis("off")
 
-        # Faint world-axis reference lines
-        for v, c in [(np.array([1,0,0]), "#2a1818"),
-                     (np.array([0,1,0]), "#182a18"),
-                     (np.array([0,0,1]), "#18182a")]:
-            ax.plot(*zip(-lim*v, lim*v), color=c, linewidth=0.5, zorder=0)
+        HL    = 1.45
+        THICK = 0.20
+        CAP_W = 0.09
 
-        # ── Magnetic north — fixed world +X arrow ────────────────────────────
-        # BNO085 SH2_ROTATION_VECTOR defines world +X as magnetic north.
-        # This arrow never moves; the board rotates around it.
-        north = np.array([1.0, 0.0, 0.0])
-        ax.quiver(0, 0, 0, *north,
-                  color=C_NORTH, linewidth=2.5,
-                  arrow_length_ratio=0.15, zorder=7,
-                  alpha=0.9)
-        ax.text(*(north * 1.22), "N", color=C_NORTH,
-                fontsize=13, fontweight="bold", zorder=8)
-        # faint south tail
-        ax.quiver(0, 0, 0, *(-north * 0.6),
-                  color=C_NORTH, linewidth=1.0,
-                  arrow_length_ratio=0.0, zorder=7, alpha=0.35)
+        # Negate: positive sin_alpha → right-end-down → clockwise in display coords
+        angle  = -math.asin(max(-1.0, min(1.0, self.sin_alpha)))
+        ca, sa = math.cos(angle), math.sin(angle)
+        px, py = -sa, ca
 
-        # ── Body-frame axes (thick arrows) ────────────────────────────────────
-        origin = np.zeros(3)
-        for col_vec, color, label in [
-            (R[:, 0], C_RED,   "X"),
-            (R[:, 1], C_GREEN, "Y"),
-            (R[:, 2], C_BLUE,  "Z"),
-        ]:
-            ax.quiver(*origin, *col_vec,
-                      color=color, linewidth=3,
-                      arrow_length_ratio=0.18, zorder=5)
-            ax.text(*(col_vec * 1.18), label,
-                    color=color, fontsize=12, fontweight="bold", zorder=6)
+        def tube_pt(along, across):
+            return (along * ca + across * px, along * sa + across * py)
 
-        # ── Board representation (coloured box) ───────────────────────────────
-        faces = box_faces(R)
-        face_colors = [C_RED, "#b03050", "#c03555", "#c03555", "#a02545", "#a02545"]
-        poly = Poly3DCollection(faces,
-                                facecolors=face_colors,
-                                edgecolors="#ff9aaf",
-                                linewidths=0.6,
-                                alpha=0.50,
-                                zorder=3)
-        ax.add_collection3d(poly)
+        # Tube body
+        ax.add_patch(mpatches.Polygon(
+            [tube_pt(-HL, THICK), tube_pt(HL, THICK),
+             tube_pt(HL, -THICK), tube_pt(-HL, -THICK)],
+            closed=True, facecolor=C_TUBE, edgecolor=C_MUTED,
+            linewidth=1.2, alpha=0.85, zorder=2,
+        ))
+        ax.add_patch(mpatches.Polygon(
+            [tube_pt(-HL, THICK),       tube_pt(HL, THICK),
+             tube_pt(HL, THICK - 0.03), tube_pt(-HL, THICK - 0.03)],
+            closed=True, facecolor="#4a6a80", alpha=0.5, zorder=3,
+        ))
 
-        # ── Heading indicator — project sensor X-axis onto XY plane ──────────
-        # Shows where the board's X axis points on the horizontal plane.
-        fwd = R[:, 0].copy(); fwd[2] = 0
-        fn = np.linalg.norm(fwd)
-        if fn > 0.05:
-            fwd /= fn
-            ax.quiver(*origin, *(fwd * 1.4),
-                      color="#ffcc44", linewidth=1.5,
-                      arrow_length_ratio=0.12, linestyle="dashed",
-                      alpha=0.6, zorder=4)
+        # End caps (flash red on impact)
+        lf = self._flash_left  > 0
+        rf = self._flash_right > 0
+        if self._flash_left  > 0: self._flash_left  -= 1
+        if self._flash_right > 0: self._flash_right -= 1
 
-        # ── Info overlay ──────────────────────────────────────────────────────
-        roll, pitch, yaw = quat_to_euler_deg(w, x, y, z)
-        _, cal_label = _accuracy_colour(self.accuracy_rad)
-        if math.isnan(self.accuracy_rad):
-            acc_str = "  Heading accuracy  ---"
-        else:
-            acc_deg = math.degrees(self.accuracy_rad)
-            acc_str = f"  Heading accuracy  ±{acc_deg:.1f}°  [{cal_label}]"
+        for side, flash in ((-1, lf), (1, rf)):
+            base = side * HL
+            ax.add_patch(mpatches.Polygon(
+                [tube_pt(base,                THICK + 0.02),
+                 tube_pt(base + side * CAP_W, THICK + 0.02),
+                 tube_pt(base + side * CAP_W, -THICK - 0.02),
+                 tube_pt(base,                -THICK - 0.02)],
+                closed=True,
+                facecolor=C_RED if flash else C_WALL,
+                edgecolor=C_MUTED, linewidth=1.0, alpha=0.95, zorder=3,
+            ))
+
+        # Ball — position mapped from [0, cavity_mm] → [−HL, +HL]
+        t_ball = (self.x_mm / max(self.cavity_mm, 1.0) - 0.5) * 2.0 * HL
+        bx, by = tube_pt(t_ball, 0)
+        spd    = abs(self.v_mps)
+        r_val  = min(spd / 1.5, 1.0)
+        ball_c = (r_val * 0.94, 0.55 + 0.30 * (1.0 - r_val), 0.15)
+        ball_r = THICK * 0.78
+        ax.add_patch(mpatches.Circle(
+            (bx, by), ball_r, facecolor=ball_c,
+            edgecolor="#ffffffaa", linewidth=1.0, zorder=5,
+        ))
+        hx = bx + ball_r * 0.28 * (-ca + px) * 0.6
+        hy = by + ball_r * 0.28 * (-sa + py) * 0.6
+        ax.add_patch(mpatches.Circle(
+            (hx, hy), ball_r * 0.28, facecolor="#ffffffaa", zorder=6
+        ))
+
+        # Tilt angle arc
+        arc_r = 0.55
+        ax.plot([-arc_r * 0.9, arc_r * 0.9], [0, 0],
+                color="#33445555", linewidth=0.8, linestyle="--", zorder=1)
+        if abs(angle) > 0.02:
+            thetas = np.linspace(0, angle, 60)
+            ax.plot(arc_r * np.cos(thetas), arc_r * np.sin(thetas),
+                    color="#ffcc44", linewidth=1.8, alpha=0.8, zorder=1)
+            mid = angle / 2
+            ax.text(
+                arc_r * 1.18 * math.cos(mid), arc_r * 1.18 * math.sin(mid),
+                f"{math.degrees(angle):+.1f}°",
+                color="#ffcc44", fontsize=9, ha="center", va="center",
+                fontfamily="monospace",
+            )
+
+        # Gravity reference arrow
+        ax.annotate(
+            "", xy=(1.75, -1.05), xytext=(1.75, -0.65),
+            arrowprops=dict(arrowstyle="-|>", color="#667788", lw=1.5, mutation_scale=9),
+            zorder=1,
+        )
+        ax.text(1.75, -0.60, "g", color="#667788", fontsize=9,
+                ha="center", va="bottom", fontfamily="monospace")
+
+        # Mode badge
+        badge_col = C_BLUE if self.mode == "ROLLING" else C_GREEN
+        ax.text(-1.75, 1.15, f"◉ {self.mode}",
+                color=badge_col, fontsize=10, fontfamily="monospace",
+                fontweight="bold", va="top")
+
+        # Connection indicator
+        sym   = "●" if self._connected else "○"
+        col   = C_GREEN if self._connected else C_RED
+        label = f"{self._conn_label} Connected" if self._connected else "Scanning…"
+        ax.text(0.55, 1.15, f"{sym} {label}",
+                color=col, fontsize=9, fontfamily="monospace", ha="center", va="top")
+
+        ax.set_xlim(-2.05, 2.05)
+        ax.set_ylim(-1.40, 1.40)
+        ax.set_aspect("equal", adjustable="box")
+
         self.info.set_text(
-            f"  Quat  w={w:+.4f}  x={x:+.4f}  y={y:+.4f}  z={z:+.4f}\n"
-            f"  Roll  {roll:+7.2f}°   Pitch {pitch:+7.2f}°   Yaw {yaw:+7.2f}°\n"
-            f"{acc_str}\n"
-            f"  Rate  {self._hz:.0f} Hz  "
+            f"  mode     {self.mode}\n"
+            f"  cavity   {self.cavity_mm:.0f} mm\n"
+            f"  position {self.x_mm:6.1f} mm\n"
+            f"  velocity {self.v_mps:+.4f} m/s\n"
+            f"  tilt     {math.degrees(angle):+.1f}°   sin={self.sin_alpha:+.3f}\n"
+            f"  rate     {self._hz:.0f} Hz  "
         )
 
-        # ── Compass rose ──────────────────────────────────────────────────────
-        self._draw_compass(yaw)
+        self._draw_history()
 
     # ------------------------------------------------------------------
-    def _draw_compass(self, yaw_deg: float):
-        """
-        Compass rose: fixed ring with N/S/E/W labels.
-        The white arrow always points to magnetic north (top of dial).
-        The red needle shows the sensor's current heading (body +X projected
-        to horizontal). The shaded cone shows heading accuracy.
-        """
-        ax = self.ax_compass
+    def _draw_history(self):
+        t = np.linspace(-HISTORY * 0.05, 0.0, HISTORY)  # assumes 20 Hz stream
+
+        ax = self.ax_pos
         ax.cla()
         ax.set_facecolor(PANEL_BG)
-        ax.set_aspect("equal")
-        ax.axis("off")
-        ax.set_xlim(-1.5, 1.5)
-        ax.set_ylim(-1.7, 1.7)
+        ax.tick_params(colors=C_MUTED, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#333")
+        ax.plot(t, list(self._x_hist), color=C_BLUE, linewidth=1.2)
+        ax.axhline(0, color="#334", linewidth=0.6)
+        ax.axhline(self.cavity_mm, color="#334", linewidth=0.6)
+        ax.set_ylim(-30, self.cavity_mm + 30)
+        ax.set_xlim(t[0], 0)
+        ax.set_ylabel("position [mm]", color=C_MUTED, fontsize=7)
+        ax.set_title("History", color=C_TEXT, fontsize=9, pad=4)
+        ax.xaxis.set_ticklabels([])
 
-        # ── Outer ring ───────────────────────────────────────────────────────
-        theta = np.linspace(0, 2 * math.pi, 256)
-        ax.plot(np.cos(theta), np.sin(theta), color=C_MUTED, linewidth=1.2, zorder=1)
-
-        # Tick marks every 10°, longer every 45°
-        for i in range(36):
-            angle = math.radians(i * 10)
-            r_inner = 0.82 if i % 9 == 0 else 0.90
-            lw = 1.2 if i % 9 == 0 else 0.5
-            ax.plot([r_inner * math.sin(angle), math.sin(angle)],
-                    [r_inner * math.cos(angle), math.cos(angle)],
-                    color=C_MUTED, linewidth=lw, zorder=1)
-
-        # Cardinal labels  (N top, E right — standard compass layout)
-        for label, ang_deg in [("N", 0), ("E", 90), ("S", 180), ("W", 270)]:
-            a = math.radians(ang_deg)
-            lx, ly = 1.28 * math.sin(a), 1.28 * math.cos(a)
-            color  = C_NORTH if label == "N" else C_MUTED
-            weight = "bold"  if label == "N" else "normal"
-            ax.text(lx, ly, label, color=color, fontsize=11,
-                    ha="center", va="center",
-                    fontweight=weight, fontfamily="monospace", zorder=3)
-
-        # ── Accuracy cone (shaded wedge around heading needle) ────────────────
-        cone_color, cal_label = _accuracy_colour(self.accuracy_rad)
-        if not math.isnan(self.accuracy_rad):
-            half = min(self.accuracy_rad, math.pi)
-            needle_ang = math.radians(yaw_deg)
-            mid_math   = math.pi / 2 - needle_ang
-            cone_t = np.linspace(mid_math - half, mid_math + half, 80)
-            cone_x = np.concatenate([[0], np.cos(cone_t)])
-            cone_y = np.concatenate([[0], np.sin(cone_t)])
-            ax.fill(cone_x, cone_y, color=cone_color, alpha=0.20, zorder=2)
-            for edge in [mid_math - half, mid_math + half]:
-                ax.plot([0, math.cos(edge)], [0, math.sin(edge)],
-                        color=cone_color, linewidth=0.6, alpha=0.5, zorder=2)
-
-        # ── Magnetic north marker — fixed white arrow pointing up ─────────────
-        # This represents the world: north is always at the top.
-        ax.annotate(
-            "", xy=(0, 0.88), xytext=(0, 0),
-            arrowprops=dict(arrowstyle="-|>", color=C_NORTH,
-                            lw=2.0, mutation_scale=12),
-            zorder=5,
-        )
-        ax.plot([0, 0], [0, -0.55], color=C_NORTH, linewidth=1.5,
-                alpha=0.5, zorder=5)
-
-        # ── Heading needle (sensor body +X projected to horizontal) ───────────
-        # Tip (red) points in the direction the board's X-axis faces.
-        yaw_rad = math.radians(yaw_deg)
-        nx =  math.sin(yaw_rad)   # east component
-        ny =  math.cos(yaw_rad)   # north component
-        # Red tip
-        ax.annotate(
-            "", xy=(nx * 0.82, ny * 0.82), xytext=(0, 0),
-            arrowprops=dict(arrowstyle="-|>", color=C_RED,
-                            lw=2.5, mutation_scale=14),
-            zorder=6,
-        )
-        # White tail (opposite end)
-        ax.plot([0, -nx * 0.55], [0, -ny * 0.55],
-                color=C_TEXT, linewidth=2.5, zorder=6)
-
-        # Centre pivot dot
-        ax.plot(0, 0, "o", color=C_TEXT, markersize=5, zorder=7)
-
-        # ── Labels ────────────────────────────────────────────────────────────
-        ax.text(0, 1.58, "Magnetic North", color=C_NORTH,
-                fontsize=8, ha="center", va="center",
-                fontfamily="monospace", zorder=3)
-        heading_norm = yaw_deg % 360
-        ax.text(0, -1.55, f"{heading_norm:.1f}°",
-                color=C_TEXT, fontsize=10, ha="center", va="center",
-                fontfamily="monospace", fontweight="bold", zorder=3)
-
-        # Small legend below the dial
-        ax.text(-1.45, -1.68, "— board +X heading",
-                color=C_RED, fontsize=7, va="bottom",
-                fontfamily="monospace", zorder=3)
-        ax.text(-1.45, -1.58, "— mag north",
-                color=C_NORTH, fontsize=7, va="bottom",
-                fontfamily="monospace", zorder=3)
-        # Calibration quality label
-        ax.text(1.45, -1.68, f"cal: {cal_label}",
-                color=cone_color, fontsize=7, va="bottom", ha="right",
-                fontfamily="monospace", zorder=3)
+        ax = self.ax_vel
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        ax.tick_params(colors=C_MUTED, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#333")
+        vdata = list(self._v_hist)
+        ax.plot(t, vdata, color=C_RED, linewidth=1.2)
+        ax.axhline(0, color="#445", linewidth=0.8, linestyle="--")
+        vmax = max(abs(min(vdata, default=0)), abs(max(vdata, default=0)), 0.1)
+        ax.set_ylim(-vmax * 1.15, vmax * 1.15)
+        ax.set_xlim(t[0], 0)
+        ax.set_ylabel("velocity [m/s]", color=C_MUTED, fontsize=7)
+        ax.set_xlabel("time [s]", color=C_MUTED, fontsize=7)
 
     # ------------------------------------------------------------------
     def _update(self, _frame):
-        self._drain_serial()
-
-        # Update Hz once per second
         now = time.monotonic()
         dt  = now - self._hz_t0
         if dt >= 1.0:
-            self._hz     = self._pkt_count / dt
+            self._hz        = self._pkt_count / dt
             self._pkt_count = 0
-            self._hz_t0  = now
-
+            self._hz_t0     = now
         self._draw_frame()
         return []
 
     def run(self):
         self._anim = animation.FuncAnimation(
             self.fig, self._update,
-            interval=30,          # ~33 fps target
-            blit=False,
-            cache_frame_data=False,
+            interval=30, blit=False, cache_frame_data=False,
         )
-        plt.tight_layout(rect=[0, 0.08, 0.74, 0.96])
         plt.show()
-        if self.ser.is_open:
-            self.ser.close()
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def list_ports():
+
+async def _list_all():
+    print("── Serial ports ──────────────────────────────────")
     ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
-    if not ports:
-        print("  (no serial ports found)")
-        return
-    for p in ports:
-        print(f"  {p.device:<12}  {p.description}")
+    if ports:
+        for p in ports:
+            print(f"  {p.device:<16}  {p.description}")
+    else:
+        print("  (none found)")
+
+    print("\n── BLE devices (scanning 5 s) ────────────────────")
+    try:
+        devices = await BleakScanner.discover(timeout=5.0)
+        if devices:
+            for d in sorted(devices, key=lambda x: x.name or ""):
+                mark = "  ← RollingStone" if d.name == DEVICE_NAME else ""
+                print(f"  {d.address}  {d.name or '(unnamed)'}{mark}")
+        else:
+            print("  (none found)")
+    except Exception as exc:
+        print(f"  BLE scan failed: {exc}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Live 3-D orientation viewer for BNO085 + Feather ESP32-C6"
+        description="Live rolling-stone sim viewer — BLE or USB serial"
     )
-    parser.add_argument("port",   nargs="?",  help="Serial port, e.g. COM3 or /dev/ttyACM0")
-    parser.add_argument("--baud", type=int,   default=115200, help="Baud rate (default 115200)")
-    parser.add_argument("--list", action="store_true", help="List available serial ports and exit")
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "COM3 or /dev/ttyACM0 → USB serial; "
+            "AA:BB:CC:DD:EE:FF → BLE direct connect; "
+            "omit → auto-scan BLE for 'RollingStone'"
+        ),
+    )
+    parser.add_argument(
+        "--baud", type=int, default=115200,
+        help="Baud rate for serial mode (default 115200)",
+    )
+    parser.add_argument(
+        "--list", action="store_true",
+        help="List available serial ports + nearby BLE devices, then exit",
+    )
     args = parser.parse_args()
 
-    if args.list or not args.port:
-        print("Available serial ports:")
-        list_ports()
-        if not args.port:
-            sys.exit(0)
+    if args.list:
+        asyncio.run(_list_all())
+        sys.exit(0)
 
-    print(f"Opening {args.port} @ {args.baud} baud …")
     try:
-        Visualizer(args.port, args.baud).run()
-    except serial.SerialException as exc:
-        print(f"Serial error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        Visualizer(args.target, args.baud).run()
     except KeyboardInterrupt:
         pass
 
