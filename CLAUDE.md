@@ -23,13 +23,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |-----|--------|
 | `r` | ROLLING mode |
 | `s` | SLIDING mode |
+| `b` | toggle rebound |
 | `+` / `=` | cavity +5 cm |
 | `-` | cavity −5 cm |
 | `q` | quit |
 
 **Serial protocol:**
 - Firmware → host: `$sin_a,x_mm,v_mps\n` at 20 Hz; `# key=val ...\n` at 1 Hz and on command replies
-- Host → firmware: single ASCII char (`r`, `s`, `+`, `-`, `?`)
+- Host → firmware: single ASCII char (`r`, `s`, `b`, `+`, `-`, `?`)
 - `?` requests an immediate status dump (`mode=`, `cavity_mm=`, `G=`, `mu=`)
 
 ## Build & Flash Commands
