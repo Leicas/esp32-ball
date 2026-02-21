@@ -19,7 +19,12 @@
       "Bash(.venv/Scripts/pio.exe run:*)",
       "Bash(\"C:\\\\Users\\\\antoinew\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -t upload)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(\"$HOME/.platformio/penv/Scripts/pio.exe\" run -e hbridge --target upload)",
+      "Bash(timeout:*)",
+      "Bash(PYTHONIOENCODING=utf-8 \"$HOME/.platformio/python3/python.exe\":*)",
+      "Bash(PYTHONIOENCODING=utf-8 \"C:/Users/antoi/.platformio/penv/Scripts/pio.exe\" run:*)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python:*)"
     ]
   }
 }

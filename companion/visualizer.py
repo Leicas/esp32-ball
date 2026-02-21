@@ -53,6 +53,7 @@ from bleak import BleakClient, BleakScanner
 
 try:
     import sounddevice as sd
+
     _AUDIO_OK = True
 except ImportError:
     _AUDIO_OK = False
@@ -64,21 +65,21 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 DEVICE_NAME = "RollingStone"
-SVC_UUID    = "19b10000-e8f2-537e-4f6c-d104768a1214"
-TELEM_UUID  = "19b10001-e8f2-537e-4f6c-d104768a1214"
-CMD_UUID    = "19b10002-e8f2-537e-4f6c-d104768a1214"
-STAT_UUID   = "19b10003-e8f2-537e-4f6c-d104768a1214"
+SVC_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214"
+TELEM_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214"
+CMD_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214"
+STAT_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214"
 
 
 # ---------------------------------------------------------------------------
 # Audio constants  (matches Feather firmware synthesis)
 # ---------------------------------------------------------------------------
 
-_SAMPLE_RATE    = 22050
-_WTABLE_SIZE    = 30
+_SAMPLE_RATE = 22050
+_WTABLE_SIZE = 30
 _IMPACT_SAMPLES = int(0.0086 * _SAMPLE_RATE + 0.5)  # ≈ 190 samples = 8.6 ms
-_IMPACT_VREF    = 0.5  # reference speed for impact (m/s) — softer scaling
-_AUDIO_GAIN     = 0.6   # overall output level
+_IMPACT_VREF = 0.5  # reference speed for impact (m/s) — softer scaling
+_AUDIO_GAIN = 0.6  # overall output level
 
 # Negative-arch wavetable: -sin(π·i / (N-1))
 _WTABLE = (
@@ -90,16 +91,16 @@ _WTABLE = (
 # Colours  (same palette as the orientation visualizer)
 # ---------------------------------------------------------------------------
 
-DARK_BG  = "#1a1a2e"
+DARK_BG = "#1a1a2e"
 PANEL_BG = "#16213e"
-INFO_BG  = "#0f3460"
-C_RED    = "#e94560"
-C_GREEN  = "#0f9b58"
-C_BLUE   = "#4f8ef7"
-C_TEXT   = "#dce3f0"
-C_MUTED  = "#6a7490"
-C_TUBE   = "#2a3a4a"
-C_WALL   = "#3a5060"
+INFO_BG = "#0f3460"
+C_RED = "#e94560"
+C_GREEN = "#0f9b58"
+C_BLUE = "#4f8ef7"
+C_TEXT = "#dce3f0"
+C_MUTED = "#6a7490"
+C_TUBE = "#2a3a4a"
+C_WALL = "#3a5060"
 
 
 # ---------------------------------------------------------------------------
@@ -117,42 +118,42 @@ class Visualizer:
         else:
             self._mode = "ble"
         self._target = target
-        self._baud   = baud
+        self._baud = baud
 
         # ── Connection state ───────────────────────────────────────────────
-        self._connected:   bool = False
-        self._conn_label:  str  = ""          # "USB" or "BLE"
-        self._ble_client:  BleakClient | None = None
-        self._ble_loop:    asyncio.AbstractEventLoop | None = None
-        self._cmd_q:       queue.SimpleQueue = queue.SimpleQueue()
+        self._connected: bool = False
+        self._conn_label: str = ""  # "USB" or "BLE"
+        self._ble_client: BleakClient | None = None
+        self._ble_loop: asyncio.AbstractEventLoop | None = None
+        self._cmd_q: queue.SimpleQueue = queue.SimpleQueue()
 
         # ── Physics state ──────────────────────────────────────────────────
-        self.sin_alpha:  float = 0.0
-        self.x_mm:       float = 500.0
-        self.v_mps:      float = 0.0
-        self.cavity_mm:  float = 1000.0
-        self.mode:       str   = "ROLLING"
+        self.sin_alpha: float = 0.0
+        self.x_mm: float = 500.0
+        self.v_mps: float = 0.0
+        self.cavity_mm: float = 1000.0
+        self.mode: str = "ROLLING"
 
         self._x_hist = collections.deque([500.0] * HISTORY, maxlen=HISTORY)
-        self._v_hist = collections.deque([0.0]   * HISTORY, maxlen=HISTORY)
+        self._v_hist = collections.deque([0.0] * HISTORY, maxlen=HISTORY)
 
-        self._pkt_count: int   = 0
-        self._hz_t0:     float = time.monotonic()
-        self._hz:        float = 0.0
+        self._pkt_count: int = 0
+        self._hz_t0: float = time.monotonic()
+        self._hz: float = 0.0
 
-        self._flash_left:  int   = 0
-        self._flash_right: int   = 0
-        self._prev_x_mm:   float = 500.0
+        self._flash_left: int = 0
+        self._flash_right: int = 0
+        self._prev_x_mm: float = 500.0
 
         # ── Audio state ────────────────────────────────────────────────────
         # Written by telemetry thread + audio callback; GIL makes float
         # assignments atomic in CPython, so no explicit lock needed.
-        self._aud_play:   bool  = False
-        self._aud_x:      float = 500.0   # extrapolated position [mm]
-        self._aud_v:      float = 0.0     # velocity [m/s]
-        self._aud_impact: int   = 0       # remaining impact samples
+        self._aud_play: bool = False
+        self._aud_x: float = 500.0  # extrapolated position [mm]
+        self._aud_v: float = 0.0  # velocity [m/s]
+        self._aud_impact: int = 0  # remaining impact samples
         self._aud_impact_amp: float = 1.0
-        self._stream             = None
+        self._stream = None
 
         # ── Start threads ──────────────────────────────────────────────────
         threading.Thread(target=self._transport_main, daemon=True).start()
@@ -165,23 +166,23 @@ class Visualizer:
 
     def _on_telem(self, sa: float, xmm: float, vmps: float):
         if xmm < 8.0 and self._prev_x_mm >= 8.0:
-            self._flash_left  = 8
-            self._aud_impact  = _IMPACT_SAMPLES
+            self._flash_left = 8
+            self._aud_impact = _IMPACT_SAMPLES
             # Softer scaling: square root of normalized speed (matches firmware)
             norm_speed = abs(vmps) / _IMPACT_VREF
             self._aud_impact_amp = min(math.sqrt(norm_speed), 1.0)
         if xmm > self.cavity_mm - 8.0 and self._prev_x_mm <= self.cavity_mm - 8.0:
             self._flash_right = 8
-            self._aud_impact  = _IMPACT_SAMPLES
+            self._aud_impact = _IMPACT_SAMPLES
             # Softer scaling: square root of normalized speed (matches firmware)
             norm_speed = abs(vmps) / _IMPACT_VREF
             self._aud_impact_amp = min(math.sqrt(norm_speed), 1.0)
         self._prev_x_mm = xmm
-        self.sin_alpha  = sa
-        self.x_mm       = xmm
-        self.v_mps      = vmps
-        self._aud_x     = xmm
-        self._aud_v     = vmps
+        self.sin_alpha = sa
+        self.x_mm = xmm
+        self.v_mps = vmps
+        self._aud_x = xmm
+        self._aud_v = vmps
         self._x_hist.append(xmm)
         self._v_hist.append(vmps)
         self._pkt_count += 1
@@ -205,7 +206,7 @@ class Visualizer:
                     pass
         elif line.startswith("#"):
             mode = None
-            cav  = None
+            cav = None
             for tok in line[1:].split():
                 k, _, v = tok.partition("=")
                 if k == "mode" and v in ("ROLLING", "SLIDING"):
@@ -238,7 +239,7 @@ class Visualizer:
         while True:
             try:
                 ser = serial.Serial(self._target, self._baud, timeout=0.05)
-                self._connected  = True
+                self._connected = True
                 self._conn_label = "USB"
                 print(f"Connected to {self._target} @ {self._baud} baud")
                 ser.write(b"?")  # request current params
@@ -285,7 +286,7 @@ class Visualizer:
             address, disconnected_callback=self._on_ble_disconnect
         ) as client:
             self._ble_client = client
-            self._connected  = True
+            self._connected = True
             self._conn_label = "BLE"
             print(f"BLE connected to {address}")
 
@@ -293,7 +294,7 @@ class Visualizer:
             self._on_ble_status(None, stat)
 
             await client.start_notify(TELEM_UUID, self._on_ble_telem)
-            await client.start_notify(STAT_UUID,  self._on_ble_status)
+            await client.start_notify(STAT_UUID, self._on_ble_status)
 
             # Poll queued commands at 20 Hz
             while client.is_connected:
@@ -306,10 +307,10 @@ class Visualizer:
                 await asyncio.sleep(0.05)
 
         self._ble_client = None
-        self._connected  = False
+        self._connected = False
 
     def _on_ble_disconnect(self, _client):
-        self._connected  = False
+        self._connected = False
         self._ble_client = None
         print("BLE disconnected — reconnecting …")
 
@@ -319,10 +320,10 @@ class Visualizer:
 
     def _on_ble_status(self, _sender, data: bytearray):
         try:
-            text  = bytes(data).decode("ascii").strip()
+            text = bytes(data).decode("ascii").strip()
             parts = text.split(",")
-            mode  = parts[0] if parts and parts[0] in ("ROLLING", "SLIDING") else None
-            cav   = float(parts[1]) if len(parts) >= 2 else None
+            mode = parts[0] if parts and parts[0] in ("ROLLING", "SLIDING") else None
+            cav = float(parts[1]) if len(parts) >= 2 else None
             self._on_status(mode, cav)
         except (ValueError, UnicodeDecodeError):
             pass
@@ -356,10 +357,10 @@ class Visualizer:
 
     def _audio_cb(self, outdata, frames, time_info, status):
         # Atomic reads via GIL (CPython float/int assignment is pointer-sized)
-        v    = self._aud_v      # m/s
-        x0   = self._aud_x     # mm
+        v = self._aud_v  # m/s
+        x0 = self._aud_x  # mm
         play = self._aud_play
-        imp  = self._aud_impact
+        imp = self._aud_impact
         imp_amp = self._aud_impact_amp
 
         # Always advance position estimate so audio is seamless when re-enabled
@@ -371,11 +372,11 @@ class Visualizer:
 
         # Vectorised rolling noise: wavetable indexed by ball position in mm,
         # so pitch rises naturally with velocity — same law as the firmware.
-        t_arr   = np.arange(frames, dtype=np.float32) / _SAMPLE_RATE
-        x_arr   = x0 + v * 1000.0 * t_arr          # mm, per sample
+        t_arr = np.arange(frames, dtype=np.float32) / _SAMPLE_RATE
+        x_arr = x0 + v * 1000.0 * t_arr  # mm, per sample
         idx_arr = np.abs(x_arr.astype(np.int32)) % _WTABLE_SIZE
-        speed   = float(np.clip(abs(v) / 2.0, 0.0, 1.0))
-        buf     = _WTABLE[idx_arr] * speed
+        speed = float(np.clip(abs(v) / 2.0, 0.0, 1.0))
+        buf = _WTABLE[idx_arr] * speed
 
         # Impact pulse overlay (rectangular, same 8.6 ms duration as firmware)
         if imp > 0:
@@ -404,20 +405,31 @@ class Visualizer:
 
         self.fig.suptitle(
             "Virtual Rolling Stone  ·  ESP32-C6  ·  Yao & Hayward, Eurohaptics 2006",
-            color=C_TEXT, fontsize=12, y=0.97,
+            color=C_TEXT,
+            fontsize=12,
+            y=0.97,
         )
 
         self.info = self.fig.text(
-            0.01, 0.01, "",
-            color=C_TEXT, fontsize=10, fontfamily="monospace",
+            0.01,
+            0.01,
+            "",
+            color=C_TEXT,
+            fontsize=10,
+            fontfamily="monospace",
             verticalalignment="bottom",
             bbox=dict(facecolor=INFO_BG, alpha=0.85, edgecolor="none", pad=7),
         )
 
         self.fig.text(
-            0.73, 0.01,
+            0.73,
+            0.01,
             "[r] Rolling  [s] Sliding\n[+] longer   [-] shorter  [q] Quit",
-            color=C_MUTED, fontsize=8, fontfamily="monospace", ha="left", va="bottom",
+            color=C_MUTED,
+            fontsize=8,
+            fontfamily="monospace",
+            ha="left",
+            va="bottom",
         )
 
         # Right column: position (top), velocity (middle), audio checkbox (bottom)
@@ -431,10 +443,12 @@ class Visualizer:
 
         if _AUDIO_OK and self._stream is not None:
             self._chk = CheckButtons(
-                ax_chk, ["♪  Play audio"], actives=[False],
+                ax_chk,
+                ["♪  Play audio"],
+                actives=[False],
                 label_props={
-                    "color":      [C_TEXT],
-                    "fontsize":   [9],
+                    "color": [C_TEXT],
+                    "fontsize": [9],
                     "fontfamily": ["monospace"],
                 },
                 frame_props={
@@ -447,9 +461,14 @@ class Visualizer:
             self._chk.on_clicked(self._on_audio_toggle)
         else:
             ax_chk.text(
-                0.08, 0.5, "♪  audio unavailable",
-                color=C_MUTED, fontsize=9, fontfamily="monospace",
-                va="center", transform=ax_chk.transAxes,
+                0.08,
+                0.5,
+                "♪  audio unavailable",
+                color=C_MUTED,
+                fontsize=9,
+                fontfamily="monospace",
+                va="center",
+                transform=ax_chk.transAxes,
             )
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
@@ -475,12 +494,12 @@ class Visualizer:
         ax.set_facecolor(PANEL_BG)
         ax.axis("off")
 
-        HL    = 1.45
+        HL = 1.45
         THICK = 0.20
         CAP_W = 0.09
 
         # Negate: positive sin_alpha → right-end-down → clockwise in display coords
-        angle  = -math.asin(max(-1.0, min(1.0, self.sin_alpha)))
+        angle = -math.asin(max(-1.0, min(1.0, self.sin_alpha)))
         ca, sa = math.cos(angle), math.sin(angle)
         px, py = -sa, ca
 
@@ -488,90 +507,167 @@ class Visualizer:
             return (along * ca + across * px, along * sa + across * py)
 
         # Tube body
-        ax.add_patch(mpatches.Polygon(
-            [tube_pt(-HL, THICK), tube_pt(HL, THICK),
-             tube_pt(HL, -THICK), tube_pt(-HL, -THICK)],
-            closed=True, facecolor=C_TUBE, edgecolor=C_MUTED,
-            linewidth=1.2, alpha=0.85, zorder=2,
-        ))
-        ax.add_patch(mpatches.Polygon(
-            [tube_pt(-HL, THICK),       tube_pt(HL, THICK),
-             tube_pt(HL, THICK - 0.03), tube_pt(-HL, THICK - 0.03)],
-            closed=True, facecolor="#4a6a80", alpha=0.5, zorder=3,
-        ))
+        ax.add_patch(
+            mpatches.Polygon(
+                [
+                    tube_pt(-HL, THICK),
+                    tube_pt(HL, THICK),
+                    tube_pt(HL, -THICK),
+                    tube_pt(-HL, -THICK),
+                ],
+                closed=True,
+                facecolor=C_TUBE,
+                edgecolor=C_MUTED,
+                linewidth=1.2,
+                alpha=0.85,
+                zorder=2,
+            )
+        )
+        ax.add_patch(
+            mpatches.Polygon(
+                [
+                    tube_pt(-HL, THICK),
+                    tube_pt(HL, THICK),
+                    tube_pt(HL, THICK - 0.03),
+                    tube_pt(-HL, THICK - 0.03),
+                ],
+                closed=True,
+                facecolor="#4a6a80",
+                alpha=0.5,
+                zorder=3,
+            )
+        )
 
         # End caps (flash red on impact)
-        lf = self._flash_left  > 0
+        lf = self._flash_left > 0
         rf = self._flash_right > 0
-        if self._flash_left  > 0: self._flash_left  -= 1
-        if self._flash_right > 0: self._flash_right -= 1
+        if self._flash_left > 0:
+            self._flash_left -= 1
+        if self._flash_right > 0:
+            self._flash_right -= 1
 
         for side, flash in ((-1, lf), (1, rf)):
             base = side * HL
-            ax.add_patch(mpatches.Polygon(
-                [tube_pt(base,                THICK + 0.02),
-                 tube_pt(base + side * CAP_W, THICK + 0.02),
-                 tube_pt(base + side * CAP_W, -THICK - 0.02),
-                 tube_pt(base,                -THICK - 0.02)],
-                closed=True,
-                facecolor=C_RED if flash else C_WALL,
-                edgecolor=C_MUTED, linewidth=1.0, alpha=0.95, zorder=3,
-            ))
+            ax.add_patch(
+                mpatches.Polygon(
+                    [
+                        tube_pt(base, THICK + 0.02),
+                        tube_pt(base + side * CAP_W, THICK + 0.02),
+                        tube_pt(base + side * CAP_W, -THICK - 0.02),
+                        tube_pt(base, -THICK - 0.02),
+                    ],
+                    closed=True,
+                    facecolor=C_RED if flash else C_WALL,
+                    edgecolor=C_MUTED,
+                    linewidth=1.0,
+                    alpha=0.95,
+                    zorder=3,
+                )
+            )
 
         # Ball — position mapped from [0, cavity_mm] → [−HL, +HL]
         t_ball = (self.x_mm / max(self.cavity_mm, 1.0) - 0.5) * 2.0 * HL
         bx, by = tube_pt(t_ball, 0)
-        spd    = abs(self.v_mps)
-        r_val  = min(spd / 1.5, 1.0)
+        spd = abs(self.v_mps)
+        r_val = min(spd / 1.5, 1.0)
         ball_c = (r_val * 0.94, 0.55 + 0.30 * (1.0 - r_val), 0.15)
         ball_r = THICK * 0.78
-        ax.add_patch(mpatches.Circle(
-            (bx, by), ball_r, facecolor=ball_c,
-            edgecolor="#ffffffaa", linewidth=1.0, zorder=5,
-        ))
+        ax.add_patch(
+            mpatches.Circle(
+                (bx, by),
+                ball_r,
+                facecolor=ball_c,
+                edgecolor="#ffffffaa",
+                linewidth=1.0,
+                zorder=5,
+            )
+        )
         hx = bx + ball_r * 0.28 * (-ca + px) * 0.6
         hy = by + ball_r * 0.28 * (-sa + py) * 0.6
-        ax.add_patch(mpatches.Circle(
-            (hx, hy), ball_r * 0.28, facecolor="#ffffffaa", zorder=6
-        ))
+        ax.add_patch(
+            mpatches.Circle((hx, hy), ball_r * 0.28, facecolor="#ffffffaa", zorder=6)
+        )
 
         # Tilt angle arc
         arc_r = 0.55
-        ax.plot([-arc_r * 0.9, arc_r * 0.9], [0, 0],
-                color="#33445555", linewidth=0.8, linestyle="--", zorder=1)
+        ax.plot(
+            [-arc_r * 0.9, arc_r * 0.9],
+            [0, 0],
+            color="#33445555",
+            linewidth=0.8,
+            linestyle="--",
+            zorder=1,
+        )
         if abs(angle) > 0.02:
             thetas = np.linspace(0, angle, 60)
-            ax.plot(arc_r * np.cos(thetas), arc_r * np.sin(thetas),
-                    color="#ffcc44", linewidth=1.8, alpha=0.8, zorder=1)
+            ax.plot(
+                arc_r * np.cos(thetas),
+                arc_r * np.sin(thetas),
+                color="#ffcc44",
+                linewidth=1.8,
+                alpha=0.8,
+                zorder=1,
+            )
             mid = angle / 2
             ax.text(
-                arc_r * 1.18 * math.cos(mid), arc_r * 1.18 * math.sin(mid),
+                arc_r * 1.18 * math.cos(mid),
+                arc_r * 1.18 * math.sin(mid),
                 f"{math.degrees(angle):+.1f}°",
-                color="#ffcc44", fontsize=9, ha="center", va="center",
+                color="#ffcc44",
+                fontsize=9,
+                ha="center",
+                va="center",
                 fontfamily="monospace",
             )
 
         # Gravity reference arrow
         ax.annotate(
-            "", xy=(1.75, -1.05), xytext=(1.75, -0.65),
-            arrowprops=dict(arrowstyle="-|>", color="#667788", lw=1.5, mutation_scale=9),
+            "",
+            xy=(1.75, -1.05),
+            xytext=(1.75, -0.65),
+            arrowprops=dict(
+                arrowstyle="-|>", color="#667788", lw=1.5, mutation_scale=9
+            ),
             zorder=1,
         )
-        ax.text(1.75, -0.60, "g", color="#667788", fontsize=9,
-                ha="center", va="bottom", fontfamily="monospace")
+        ax.text(
+            1.75,
+            -0.60,
+            "g",
+            color="#667788",
+            fontsize=9,
+            ha="center",
+            va="bottom",
+            fontfamily="monospace",
+        )
 
         # Mode badge
         badge_col = C_BLUE if self.mode == "ROLLING" else C_GREEN
-        ax.text(-1.75, 1.15, f"◉ {self.mode}",
-                color=badge_col, fontsize=10, fontfamily="monospace",
-                fontweight="bold", va="top")
+        ax.text(
+            -1.75,
+            1.15,
+            f"◉ {self.mode}",
+            color=badge_col,
+            fontsize=10,
+            fontfamily="monospace",
+            fontweight="bold",
+            va="top",
+        )
 
         # Connection indicator
-        sym   = "●" if self._connected else "○"
-        col   = C_GREEN if self._connected else C_RED
+        sym = "●" if self._connected else "○"
+        col = C_GREEN if self._connected else C_RED
         label = f"{self._conn_label} Connected" if self._connected else "Scanning…"
-        ax.text(0.55, 1.15, f"{sym} {label}",
-                color=col, fontsize=9, fontfamily="monospace", ha="center", va="top")
+        ax.text(
+            0.55,
+            1.15,
+            f"{sym} {label}",
+            color=col,
+            fontsize=9,
+            fontfamily="monospace",
+            ha="center",
+            va="top",
+        )
 
         ax.set_xlim(-2.05, 2.05)
         ax.set_ylim(-1.40, 1.40)
@@ -625,18 +721,21 @@ class Visualizer:
     # ------------------------------------------------------------------
     def _update(self, _frame):
         now = time.monotonic()
-        dt  = now - self._hz_t0
+        dt = now - self._hz_t0
         if dt >= 1.0:
-            self._hz        = self._pkt_count / dt
+            self._hz = self._pkt_count / dt
             self._pkt_count = 0
-            self._hz_t0     = now
+            self._hz_t0 = now
         self._draw_frame()
         return []
 
     def run(self):
         self._anim = animation.FuncAnimation(
-            self.fig, self._update,
-            interval=30, blit=False, cache_frame_data=False,
+            self.fig,
+            self._update,
+            interval=30,
+            blit=False,
+            cache_frame_data=False,
         )
         plt.show()
 
@@ -682,11 +781,14 @@ def main():
         ),
     )
     parser.add_argument(
-        "--baud", type=int, default=115200,
+        "--baud",
+        type=int,
+        default=115200,
         help="Baud rate for serial mode (default 115200)",
     )
     parser.add_argument(
-        "--list", action="store_true",
+        "--list",
+        action="store_true",
         help="List available serial ports + nearby BLE devices, then exit",
     )
     args = parser.parse_args()
