@@ -31,6 +31,7 @@
 #include "physics.h"
 #include "haptic.h"
 #include "comms.h"
+#include "marbles.h"
 
 #ifdef HBRIDGE
 #include "driver/gpio.h"  // gpio_hold_dis
@@ -62,18 +63,37 @@ static void taskPhysics(void * /*param*/)
         // 1. Read IMU
         imuUpdate();
 
-        // 2. Physics step
-        ImpactInfo impact = physicsStep(PHYS_H, imu_sin_alpha, imu_lin_accel_x);
+        if (g_sim_mode == SimMode::MARBLES) {
+            // 2a. Marble box physics (box acceleration + gravity)
+            float impact = marblesStep(PHYS_H,
+                                       imu_lin_accel_x,  // box acceleration X [m/s²]
+                                       imu_lin_accel_y,  // box acceleration Y [m/s²]
+                                       imu_lin_accel_z,  // box acceleration Z [m/s²]
+                                       imu_grav_z);      // gravity Z [m/s²]
 
-        // 3. Haptic — pass impact speed (0 = no impact); amplitude scales with energy
-        hapticUpdate(phys_x_pos, phys_x_vel,
-                     g_sim_mode == SimMode::ROLLING,
-                     impact.hit ? impact.speed : 0.0f);
+            // 3a. Haptic — scale marble impact speed to tube haptic reference
+            hapticUpdate(0.0f, 0.0f, false,
+                         impact * (HAPTIC_IMPACT_REF / MARBLE_IMPACT_REF));
 
-        // 4. Publish telemetry snapshot for comms task
-        telem_sin_alpha = imu_sin_alpha;
-        telem_x_mm      = phys_x_pos * 1000.0f;
-        telem_x_vel     = phys_x_vel;
+            // 4a. Telemetry snapshot for marble stream
+            telem_grav_x        = imu_lin_accel_x / 9.8f;  // normalize for display
+            telem_grav_y        = imu_lin_accel_y / 9.8f;
+            telem_grav_z        = (imu_lin_accel_z + imu_grav_z) / 9.8f;
+            telem_impact_energy = fminf(impact / MARBLE_IMPACT_REF, 1.0f);
+        } else {
+            // 2b. Tube physics step
+            ImpactInfo impact = physicsStep(PHYS_H, imu_sin_alpha, imu_lin_accel_x);
+
+            // 3b. Haptic — amplitude scales with impact energy
+            hapticUpdate(phys_x_pos, phys_x_vel,
+                         g_sim_mode == SimMode::ROLLING,
+                         impact.hit ? impact.speed : 0.0f);
+
+            // 4b. Publish telemetry snapshot for comms task
+            telem_sin_alpha = imu_sin_alpha;
+            telem_x_mm      = phys_x_pos * 1000.0f;
+            telem_x_vel     = phys_x_vel;
+        }
 
         // 5. Measure actual physics rate (updated every second)
         step_count++;
@@ -103,7 +123,10 @@ static void taskComms(void * /*param*/)
         commsHandleSerial();
 
         if (now - last_telem_ms >= TELEM_PERIOD_MS) {
-            commsStreamTelemetry();
+            if (g_sim_mode == SimMode::MARBLES)
+                commsStreamMarbles();
+            else
+                commsStreamTelemetry();
             last_telem_ms = now;
         }
 
@@ -169,6 +192,7 @@ void setup()
 
     // ── Init modules ─────────────────────────────────────────────────────────
     physicsInit();
+    marblesInit();
     hapticInit();  // configures LEDC (HBRIDGE) or I2S channel (feather)
     commsInit();   // serial + BLE
 
@@ -183,7 +207,8 @@ void setup()
     );
     Serial.println("================================");
     Serial.printf("# mode=%s  cavity_mm=%.0f  rebound=%d  G=%.1f  mu=%.2f\n",
-                  g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
+                  g_sim_mode == SimMode::ROLLING ? "ROLLING" :
+                  g_sim_mode == SimMode::SLIDING ? "SLIDING" : "MARBLES",
                   g_cavity * 1000.0f, g_rebound ? 1 : 0, G_FACTOR, FRICTION_MU);
     Serial.printf("# physics=%d Hz  telem=%lu Hz\n",
                   PHYS_HZ, 1000UL / TELEM_PERIOD_MS);

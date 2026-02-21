@@ -9,6 +9,10 @@ static sh2_SensorValue_t s_sv;
 
 volatile float imu_sin_alpha   = 0.0f;
 volatile float imu_lin_accel_x = 0.0f;
+volatile float imu_lin_accel_y = 0.0f;
+volatile float imu_lin_accel_z = 0.0f;
+volatile float imu_grav_y      = 0.0f;
+volatile float imu_grav_z      = 0.0f;
 
 static void enableReports()
 {
@@ -49,9 +53,13 @@ void imuUpdate()
         case SH2_GRAVITY:
             imu_sin_alpha = fmaxf(-1.0f, fminf(1.0f,
                                   s_sv.un.gravity.x / 9.8f));
+            imu_grav_y    = s_sv.un.gravity.y;  // raw m/s²
+            imu_grav_z    = s_sv.un.gravity.z;  // raw m/s²
             break;
         case SH2_LINEAR_ACCELERATION:
             imu_lin_accel_x = s_sv.un.linearAcceleration.x;
+            imu_lin_accel_y = s_sv.un.linearAcceleration.y;
+            imu_lin_accel_z = s_sv.un.linearAcceleration.z;
             break;
         }
     }

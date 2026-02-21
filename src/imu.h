@@ -11,4 +11,8 @@ void imuUpdate();
 
 // Latest sensor readings (written by imuUpdate, read by physics task)
 extern volatile float imu_sin_alpha;    // sin of tube tilt (gravity X / g)
-extern volatile float imu_lin_accel_x;  // tube linear acceleration [m/s²]
+extern volatile float imu_lin_accel_x;  // tube linear acceleration X [m/s²]
+extern volatile float imu_lin_accel_y;  // tube linear acceleration Y [m/s²]
+extern volatile float imu_lin_accel_z;  // tube linear acceleration Z [m/s²]
+extern volatile float imu_grav_y;       // raw gravity Y [m/s²]
+extern volatile float imu_grav_z;       // raw gravity Z [m/s²]

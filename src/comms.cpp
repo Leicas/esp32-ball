@@ -1,16 +1,28 @@
 #include "comms.h"
 #include "config.h"
 #include "physics.h"
+#include "marbles.h"
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 
 // ── Telemetry snapshot (defined here, extern'd in comms.h) ───────────────────
-volatile float    telem_sin_alpha = 0.0f;
-volatile float    telem_x_mm     = 0.0f;
-volatile float    telem_x_vel    = 0.0f;
-volatile uint32_t telem_phys_hz  = 0;
+volatile float    telem_sin_alpha     = 0.0f;
+volatile float    telem_x_mm         = 0.0f;
+volatile float    telem_x_vel        = 0.0f;
+volatile uint32_t telem_phys_hz      = 0;
+volatile float    telem_grav_x       = 0.0f;
+volatile float    telem_grav_y       = 0.0f;
+volatile float    telem_grav_z       = 0.0f;
+volatile float    telem_impact_energy = 0.0f;
+
+static const char *modeStr()
+{
+    if (g_sim_mode == SimMode::ROLLING) return "ROLLING";
+    if (g_sim_mode == SimMode::SLIDING) return "SLIDING";
+    return "MARBLES";
+}
 
 // ── BLE UUIDs ─────────────────────────────────────────────────────────────────
 static const char *BLE_DEV_NAME  = "RollingStone";
@@ -31,8 +43,7 @@ static void bleSendStatus()
     if (!s_ble_stat) return;
     char buf[64];
     snprintf(buf, sizeof(buf), "%s,%.0f,rebound=%d",
-             g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
-             g_cavity * 1000.0f, g_rebound ? 1 : 0);
+             modeStr(), g_cavity * 1000.0f, g_rebound ? 1 : 0);
     s_ble_stat->setValue(buf);
     s_ble_stat->notify();
 }
@@ -58,6 +69,12 @@ static void handleCommand(char c)
         Serial.println("# mode=SLIDING");
         bleSendStatus();
         break;
+    case 'm':
+        marblesInit();
+        g_sim_mode = SimMode::MARBLES;
+        Serial.println("# mode=MARBLES");
+        bleSendStatus();
+        break;
     case 'b':
         g_rebound = !g_rebound;
         Serial.printf("# rebound=%d\n", g_rebound ? 1 : 0);
@@ -76,8 +93,7 @@ static void handleCommand(char c)
         break;
     case '?':
         Serial.printf("# mode=%s  cavity_mm=%.0f  rebound=%d  G=%.1f  mu=%.2f\n",
-                      g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
-                      g_cavity * 1000.0f, g_rebound ? 1 : 0,
+                      modeStr(), g_cavity * 1000.0f, g_rebound ? 1 : 0,
                       G_FACTOR, FRICTION_MU);
         break;
     }
@@ -152,12 +168,53 @@ void commsStreamTelemetry()
 
 void commsSendStatus()
 {
-    Serial.printf("# sin_a=%+.3f  x_mm=%.1f  v_mps=%+.4f  phys_hz=%lu  mode=%s  cavity_mm=%.0f  rebound=%d\n",
-                  (float)telem_sin_alpha, (float)telem_x_mm, (float)telem_x_vel,
-                  (uint32_t)telem_phys_hz,
-                  g_sim_mode == SimMode::ROLLING ? "ROLLING" : "SLIDING",
-                  g_cavity * 1000.0f, g_rebound ? 1 : 0);
+    if (g_sim_mode == SimMode::MARBLES) {
+        Serial.printf("# grav_x=%+.3f  grav_y=%+.3f  grav_z=%+.3f  phys_hz=%lu  mode=%s\n",
+                      (float)telem_grav_x, (float)telem_grav_y, (float)telem_grav_z,
+                      (uint32_t)telem_phys_hz, modeStr());
+    } else {
+        Serial.printf("# sin_a=%+.3f  x_mm=%.1f  v_mps=%+.4f  phys_hz=%lu  mode=%s  cavity_mm=%.0f  rebound=%d\n",
+                      (float)telem_sin_alpha, (float)telem_x_mm, (float)telem_x_vel,
+                      (uint32_t)telem_phys_hz, modeStr(),
+                      g_cavity * 1000.0f, g_rebound ? 1 : 0);
+    }
     bleSendStatus();
+}
+
+void commsStreamMarbles()
+{
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "@%+.3f,%+.3f,%+.3f,%.3f",
+                     (float)telem_grav_x,
+                     (float)telem_grav_y,
+                     (float)telem_grav_z,
+                     (float)telem_impact_energy);
+    for (int i = 0; i < MARBLE_COUNT; i++) {
+        n += snprintf(buf + n, (int)sizeof(buf) - n,
+                      ",%.1f,%.1f,%.1f",
+                      g_marbles[i].x * 1000.0f,
+                      g_marbles[i].y * 1000.0f,
+                      g_marbles[i].z * 1000.0f);
+    }
+    snprintf(buf + n, (int)sizeof(buf) - n, "\n");
+    Serial.print(buf);
+
+    // BLE: send marble data (4 header floats + MARBLE_COUNT × 3 position floats)
+    if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem) {
+        const int float_count = 4 + MARBLE_COUNT * 3;
+        float pkt[float_count];
+        pkt[0] = telem_grav_x;
+        pkt[1] = telem_grav_y;
+        pkt[2] = telem_grav_z;
+        pkt[3] = telem_impact_energy;
+        for (int i = 0; i < MARBLE_COUNT; i++) {
+            pkt[4 + i * 3 + 0] = g_marbles[i].x * 1000.0f;
+            pkt[4 + i * 3 + 1] = g_marbles[i].y * 1000.0f;
+            pkt[4 + i * 3 + 2] = g_marbles[i].z * 1000.0f;
+        }
+        s_ble_telem->setValue((uint8_t *)pkt, sizeof(pkt));
+        s_ble_telem->notify();
+    }
 }
 
 void commsCheckDoubleTap(float /*accel_mag_mps2*/)

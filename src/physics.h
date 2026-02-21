@@ -1,6 +1,6 @@
 #pragma once
 
-enum class SimMode { ROLLING, SLIDING };
+enum class SimMode { ROLLING, SLIDING, MARBLES };
 
 struct ImpactInfo {
     bool  hit;

@@ -13,8 +13,9 @@ Transport selection (positional argument):
 
 BLE GATT layout (firmware):
     Service  UUID : 19b10000-e8f2-537e-4f6c-d104768a1214
-    Telemetry     : 19b10001-...  NOTIFY   float32[3]: sin_alpha, x_mm, v_mps
-    Command       : 19b10002-...  WRITE    1 ASCII byte: r/s/+/-/?
+    Telemetry     : 19b10001-...  NOTIFY   float32[3]: sin_alpha, x_mm, v_mps (tube)
+                                           OR float32[22]: grav_x/y/z, impact, 6x(x,y,z) (marbles)
+    Command       : 19b10002-...  WRITE    1 ASCII byte: r/s/m/+/-/?
     Status        : 19b10003-...  READ+NOTIFY  ASCII "MODE,cavity_mm"
 
 Audio synthesis:
@@ -49,6 +50,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.patches as mpatches
 from matplotlib.widgets import CheckButtons
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from bleak import BleakClient, BleakScanner
 
 try:
@@ -102,6 +104,16 @@ C_MUTED = "#6a7490"
 C_TUBE = "#2a3a4a"
 C_WALL = "#3a5060"
 
+# ---------------------------------------------------------------------------
+# Marble box constants  (must match firmware config.h)
+# ---------------------------------------------------------------------------
+
+_MARBLE_COUNT  = 3
+_BOX_W_MM      = 120.0
+_BOX_H_MM      =  80.0
+_BOX_D_MM      =  80.0
+_MARBLE_RAD_MM =   8.0
+
 
 # ---------------------------------------------------------------------------
 # Visualizer
@@ -133,6 +145,7 @@ class Visualizer:
         self.v_mps: float = 0.0
         self.cavity_mm: float = 1000.0
         self.mode: str = "ROLLING"
+        self.phys_hz: int = 0
 
         self._x_hist = collections.deque([500.0] * HISTORY, maxlen=HISTORY)
         self._v_hist = collections.deque([0.0] * HISTORY, maxlen=HISTORY)
@@ -144,6 +157,15 @@ class Visualizer:
         self._flash_left: int = 0
         self._flash_right: int = 0
         self._prev_x_mm: float = 500.0
+
+        # ── Marble mode state ──────────────────────────────────────────────
+        self.marble_mode: bool = False
+        self.marbles: list = [(_BOX_W_MM / 2, _BOX_H_MM / 2, _BOX_D_MM / 2)] * _MARBLE_COUNT
+        self.grav_x: float = 0.0
+        self.grav_y: float = 0.0
+        self.grav_z: float = 0.0
+        self.impact_energy: float = 0.0
+        self._marble_impact_flash: int = 0
 
         # ── Audio state ────────────────────────────────────────────────────
         # Written by telemetry thread + audio callback; GIL makes float
@@ -190,8 +212,24 @@ class Visualizer:
     def _on_status(self, mode: str | None, cavity_mm: float | None):
         if mode:
             self.mode = mode
+            self.marble_mode = (mode == "MARBLES")
         if cavity_mm is not None:
             self.cavity_mm = cavity_mm
+
+    def _on_telem_marble(self, grav_x, grav_y, grav_z, impact_e, positions):
+        self.grav_x = grav_x
+        self.grav_y = grav_y
+        self.grav_z = grav_z
+        self.impact_energy = impact_e
+        self.marbles = positions
+        self.marble_mode = True
+        self.mode = "MARBLES"
+        if positions:
+            self._x_hist.append(positions[0][0])
+            self._v_hist.append(positions[0][1])
+        if impact_e > 0.15:
+            self._marble_impact_flash = 8
+        self._pkt_count += 1
 
     def _parse_line(self, line: str):
         """Parse one telemetry or status line from the serial stream."""
@@ -204,18 +242,39 @@ class Visualizer:
                     self._on_telem(*map(float, parts))
                 except ValueError:
                     pass
+        elif line.startswith("@"):
+            parts = line[1:].split(",")
+            expected = 4 + _MARBLE_COUNT * 3
+            if len(parts) == expected:
+                try:
+                    vals = list(map(float, parts))
+                    positions = [
+                        (vals[4 + i * 3], vals[4 + i * 3 + 1], vals[4 + i * 3 + 2])
+                        for i in range(_MARBLE_COUNT)
+                    ]
+                    self._on_telem_marble(vals[0], vals[1], vals[2], vals[3], positions)
+                except ValueError:
+                    pass
         elif line.startswith("#"):
             mode = None
             cav = None
             for tok in line[1:].split():
                 k, _, v = tok.partition("=")
-                if k == "mode" and v in ("ROLLING", "SLIDING"):
+                if k == "mode" and v in ("ROLLING", "SLIDING", "MARBLES"):
                     mode = v
                 elif k == "cavity_mm":
                     try:
                         cav = float(v)
                     except ValueError:
                         pass
+                elif k == "phys_hz":
+                    try:
+                        self.phys_hz = int(v)
+                    except ValueError:
+                        pass
+                elif k in ("grav_x", "grav_y", "grav_z"):
+                    # Parse gravity/accel values for marble mode status
+                    pass
             self._on_status(mode, cav)
 
     # ------------------------------------------------------------------
@@ -316,13 +375,23 @@ class Visualizer:
 
     def _on_ble_telem(self, _sender, data: bytearray):
         if len(data) >= 12:
-            self._on_telem(*struct.unpack_from("<fff", data))
+            # Tube mode: 3 floats (sin_alpha, x_mm, v_mps)
+            if len(data) == 12:
+                self._on_telem(*struct.unpack_from("<fff", data))
+            # Marble mode: 4 header floats + MARBLE_COUNT * 3 position floats
+            elif len(data) == 4 * (4 + _MARBLE_COUNT * 3):
+                vals = struct.unpack_from(f"<{4 + _MARBLE_COUNT * 3}f", data)
+                positions = [
+                    (vals[4 + i * 3], vals[4 + i * 3 + 1], vals[4 + i * 3 + 2])
+                    for i in range(_MARBLE_COUNT)
+                ]
+                self._on_telem_marble(vals[0], vals[1], vals[2], vals[3], positions)
 
     def _on_ble_status(self, _sender, data: bytearray):
         try:
             text = bytes(data).decode("ascii").strip()
             parts = text.split(",")
-            mode = parts[0] if parts and parts[0] in ("ROLLING", "SLIDING") else None
+            mode = parts[0] if parts and parts[0] in ("ROLLING", "SLIDING", "MARBLES") else None
             cav = float(parts[1]) if len(parts) >= 2 else None
             self._on_status(mode, cav)
         except (ValueError, UnicodeDecodeError):
@@ -401,7 +470,9 @@ class Visualizer:
         matplotlib.rcParams["toolbar"] = "None"
         self.fig = plt.figure(figsize=(13, 8), facecolor=DARK_BG)
 
+        # Main axis starts as 2D, will be replaced with 3D when marble mode activates
         self.ax = self.fig.add_axes([0.01, 0.12, 0.70, 0.80], facecolor=PANEL_BG)
+        self.ax_is_3d = False
 
         self.fig.suptitle(
             "Virtual Rolling Stone  ·  ESP32-C6  ·  Yao & Hayward, Eurohaptics 2006",
@@ -424,7 +495,7 @@ class Visualizer:
         self.fig.text(
             0.73,
             0.01,
-            "[r] Rolling  [s] Sliding\n[+] longer   [-] shorter  [q] Quit",
+            "[r] Rolling  [s] Sliding  [m] Marbles\n[+] longer   [-] shorter   [q] Quit",
             color=C_MUTED,
             fontsize=8,
             fontfamily="monospace",
@@ -474,21 +545,68 @@ class Visualizer:
         self.fig.canvas.mpl_connect("close_event", self._on_close)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
+    def _ensure_3d_axis(self):
+        """Convert main axis to 3D if not already."""
+        if not self.ax_is_3d:
+            self.ax.remove()
+            self.ax = self.fig.add_axes([0.01, 0.12, 0.70, 0.80], 
+                                        facecolor=PANEL_BG, 
+                                        projection='3d')
+            self.ax_is_3d = True
+
+    def _ensure_2d_axis(self):
+        """Convert main axis to 2D if not already."""
+        if self.ax_is_3d:
+            self.ax.remove()
+            self.ax = self.fig.add_axes([0.01, 0.12, 0.70, 0.80], facecolor=PANEL_BG)
+            self.ax_is_3d = False
+
     def _on_close(self, _event):
         if self._stream:
             self._stream.stop()
             self._stream.close()
 
     def _on_key(self, event):
-        cmd = {"r": b"r", "s": b"s", "+": b"+", "=": b"+", "-": b"-"}.get(event.key)
+        cmd = {"r": b"r", "s": b"s", "m": b"m", "+": b"+", "=": b"+", "-": b"-"}.get(event.key)
         if cmd:
             self._send_cmd(cmd)
+            if event.key == "m":
+                self.marble_mode = True  # optimistic; confirmed by status reply
         elif event.key == "q":
             plt.close("all")
             sys.exit(0)
 
     # ------------------------------------------------------------------
+    def _ensure_2d_axis(self):
+        """Ensure main axis is 2D for tube mode."""
+        if hasattr(self.ax, 'zaxis'):
+            # Recreate as 2D axis
+            pos = self.ax.get_position()
+            self.ax.remove()
+            self.ax = self.fig.add_axes([pos.x0, pos.y0, pos.width, pos.height], 
+                                        facecolor=PANEL_BG)
+
+    def _ensure_3d_axis(self):
+        """Ensure main axis is 3D for marble mode."""
+        if not hasattr(self.ax, 'zaxis'):
+            # Recreate as 3D axis
+            pos = self.ax.get_position()
+            self.ax.remove()
+            self.ax = self.fig.add_axes([pos.x0, pos.y0, pos.width, pos.height], 
+                                        projection='3d', facecolor=PANEL_BG)
+
+    # ------------------------------------------------------------------
     def _draw_frame(self):
+        if self.marble_mode:
+            self._ensure_3d_axis()
+            self._draw_marble_box()
+            self._draw_marble_history()
+        else:
+            self._ensure_2d_axis()
+            self._draw_tube()
+            self._draw_history()
+
+    def _draw_tube(self):
         ax = self.ax
         ax.cla()
         ax.set_facecolor(PANEL_BG)
@@ -631,27 +749,17 @@ class Visualizer:
             zorder=1,
         )
         ax.text(
-            1.75,
-            -0.60,
-            "g",
-            color="#667788",
-            fontsize=9,
-            ha="center",
-            va="bottom",
+            1.75, -0.60, "g",
+            color="#667788", fontsize=9, ha="center", va="bottom",
             fontfamily="monospace",
         )
 
         # Mode badge
         badge_col = C_BLUE if self.mode == "ROLLING" else C_GREEN
         ax.text(
-            -1.75,
-            1.15,
-            f"◉ {self.mode}",
-            color=badge_col,
-            fontsize=10,
-            fontfamily="monospace",
-            fontweight="bold",
-            va="top",
+            -1.75, 1.15, f"◉ {self.mode}",
+            color=badge_col, fontsize=10, fontfamily="monospace",
+            fontweight="bold", va="top",
         )
 
         # Connection indicator
@@ -659,15 +767,20 @@ class Visualizer:
         col = C_GREEN if self._connected else C_RED
         label = f"{self._conn_label} Connected" if self._connected else "Scanning…"
         ax.text(
-            0.55,
-            1.15,
-            f"{sym} {label}",
-            color=col,
-            fontsize=9,
-            fontfamily="monospace",
-            ha="center",
-            va="top",
+            0.55, 1.15, f"{sym} {label}",
+            color=col, fontsize=9, fontfamily="monospace",
+            ha="center", va="top",
         )
+
+        # Physics Hz (colour-coded: green ≥900, yellow ≥700, red <700)
+        hz = self.phys_hz
+        if hz > 0:
+            phz_col = C_GREEN if hz >= 900 else ("#ffcc44" if hz >= 700 else C_RED)
+            ax.text(
+                -2.0, -1.33, f"⚡ {hz} / 1000 Hz",
+                color=phz_col, fontsize=9, fontfamily="monospace",
+                va="bottom", zorder=10,
+            )
 
         ax.set_xlim(-2.05, 2.05)
         ax.set_ylim(-1.40, 1.40)
@@ -679,14 +792,125 @@ class Visualizer:
             f"  position {self.x_mm:6.1f} mm\n"
             f"  velocity {self.v_mps:+.4f} m/s\n"
             f"  tilt     {math.degrees(angle):+.1f}°   sin={self.sin_alpha:+.3f}\n"
-            f"  rate     {self._hz:.0f} Hz  "
+            f"  serial   {self._hz:.0f} Hz\n"
+            f"  physics  {self.phys_hz} / 1000 Hz"
         )
 
-        self._draw_history()
+    def _draw_marble_box(self):
+        ax = self.ax
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        ax.grid(False)
+
+        W, H, D, R = _BOX_W_MM, _BOX_H_MM, _BOX_D_MM, _MARBLE_RAD_MM
+
+        # Draw 3D box wireframe
+        vertices = np.array([
+            [0, 0, 0], [W, 0, 0], [W, H, 0], [0, H, 0],  # front face (z=0)
+            [0, 0, D], [W, 0, D], [W, H, D], [0, H, D],  # back face (z=D)
+        ])
+        
+        # Define the 6 faces of the box
+        faces = [
+            [vertices[0], vertices[1], vertices[2], vertices[3]],  # front
+            [vertices[4], vertices[5], vertices[6], vertices[7]],  # back
+            [vertices[0], vertices[1], vertices[5], vertices[4]],  # bottom
+            [vertices[2], vertices[3], vertices[7], vertices[6]],  # top
+            [vertices[0], vertices[3], vertices[7], vertices[4]],  # left
+            [vertices[1], vertices[2], vertices[6], vertices[5]],  # right
+        ]
+        
+        box = Poly3DCollection(faces, alpha=0.15, facecolor=C_TUBE, 
+                               edgecolor=C_MUTED, linewidths=1.5)
+        ax.add_collection3d(box)
+
+        # Impact flash overlay (change alpha of box)
+        if self._marble_impact_flash > 0:
+            flash_alpha = self._marble_impact_flash / 8.0 * 0.5
+            self._marble_impact_flash -= 1
+            flash_overlay = Poly3DCollection(faces, alpha=flash_alpha, 
+                                            facecolor=C_RED, edgecolor="none")
+            ax.add_collection3d(flash_overlay)
+
+        # Draw marbles as spheres
+        u = np.linspace(0, 2 * np.pi, 15)
+        v = np.linspace(0, np.pi, 10)
+        sphere_x = R * np.outer(np.cos(u), np.sin(v))
+        sphere_y = R * np.outer(np.sin(u), np.sin(v))
+        sphere_z = R * np.outer(np.ones(np.size(u)), np.cos(v))
+
+        for mx, my, mz in self.marbles:
+            ax.plot_surface(sphere_x + mx, sphere_y + my, sphere_z + mz,
+                          color=C_BLUE, alpha=0.92, edgecolor='#ffffff88', 
+                          linewidth=0.3, shade=True)
+
+        # Gravity arrow (3D arrow from center bottom)
+        arrow_len = 25.0
+        cx, cy, cz = W / 2, H / 2, 0
+        gx_a = self.grav_x * arrow_len
+        gy_a = self.grav_y * arrow_len
+        gz_a = self.grav_z * arrow_len
+        ax.quiver(cx, cy, cz, gx_a, gy_a, gz_a,
+                 color='#ffcc44', arrow_length_ratio=0.3, linewidth=2)
+        ax.text(cx + gx_a * 1.3, cy + gy_a * 1.3, cz + gz_a * 1.3, "a",
+               color="#ffcc44", fontsize=10, fontfamily="monospace")
+
+        # Set equal aspect ratio and limits
+        ax.set_xlim([-10, W + 10])
+        ax.set_ylim([-10, H + 10])
+        ax.set_zlim([-10, D + 10])
+        ax.set_box_aspect([W, H, D])
+        
+        # Labels
+        ax.set_xlabel('X [mm]', color=C_MUTED, fontsize=8)
+        ax.set_ylabel('Y [mm]', color=C_MUTED, fontsize=8)
+        ax.set_zlabel('Z [mm]', color=C_MUTED, fontsize=8)
+        
+        ax.tick_params(colors=C_MUTED, labelsize=7)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.xaxis.pane.set_edgecolor('#333')
+        ax.yaxis.pane.set_edgecolor('#333')
+        ax.zaxis.pane.set_edgecolor('#333')
+
+        # View angle
+        ax.view_init(elev=20, azim=45)
+
+        # Mode badge (as 2D text overlay)
+        self.fig.text(0.02, 0.90, "◉ MARBLES",
+                     color=C_GREEN, fontsize=10, fontfamily="monospace",
+                     fontweight="bold")
+
+        # Connection indicator
+        sym = "●" if self._connected else "○"
+        col = C_GREEN if self._connected else C_RED
+        label = f"{self._conn_label} Connected" if self._connected else "Scanning…"
+        self.fig.text(0.35, 0.90, f"{sym} {label}",
+                     color=col, fontsize=9, fontfamily="monospace")
+
+        # Physics Hz
+        hz = self.phys_hz
+        if hz > 0:
+            phz_col = C_GREEN if hz >= 900 else ("#ffcc44" if hz >= 700 else C_RED)
+            self.fig.text(0.02, 0.13, f"⚡ {hz} / 1000 Hz",
+                         color=phz_col, fontsize=9, fontfamily="monospace")
+
+        self.info.set_text(
+            f"  mode     MARBLES\n"
+            f"  marbles  {_MARBLE_COUNT}\n"
+            f"  box      {_BOX_W_MM:.0f} x {_BOX_H_MM:.0f} x {_BOX_D_MM:.0f} mm\n"
+            f"  accel_x  {self.grav_x:+.3f} g\n"
+            f"  accel_y  {self.grav_y:+.3f} g\n"
+            f"  accel_z  {self.grav_z:+.3f} g\n"
+            f"  impact   {self.impact_energy:.2f}\n"
+            f"  serial   {self._hz:.0f} Hz\n"
+            f"  physics  {self.phys_hz} / 1000 Hz"
+        )
 
     # ------------------------------------------------------------------
     def _draw_history(self):
-        t = np.linspace(-HISTORY * 0.05, 0.0, HISTORY)  # assumes 20 Hz stream
+        t = np.linspace(-HISTORY / 58.0, 0.0, HISTORY)
 
         ax = self.ax_pos
         ax.cla()
@@ -716,6 +940,38 @@ class Visualizer:
         ax.set_ylim(-vmax * 1.15, vmax * 1.15)
         ax.set_xlim(t[0], 0)
         ax.set_ylabel("velocity [m/s]", color=C_MUTED, fontsize=7)
+        ax.set_xlabel("time [s]", color=C_MUTED, fontsize=7)
+
+    def _draw_marble_history(self):
+        t = np.linspace(-HISTORY / 58.0, 0.0, HISTORY)
+
+        ax = self.ax_pos
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        ax.tick_params(colors=C_MUTED, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#333")
+        ax.plot(t, list(self._x_hist), color=C_BLUE, linewidth=1.2)
+        ax.axhline(0, color="#334", linewidth=0.6)
+        ax.axhline(_BOX_W_MM, color="#334", linewidth=0.6)
+        ax.set_ylim(-5, _BOX_W_MM + 5)
+        ax.set_xlim(t[0], 0)
+        ax.set_ylabel("marble 0  x [mm]", color=C_MUTED, fontsize=7)
+        ax.set_title("History", color=C_TEXT, fontsize=9, pad=4)
+        ax.xaxis.set_ticklabels([])
+
+        ax = self.ax_vel
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        ax.tick_params(colors=C_MUTED, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#333")
+        ax.plot(t, list(self._v_hist), color=C_RED, linewidth=1.2)
+        ax.axhline(0, color="#445", linewidth=0.8, linestyle="--")
+        ax.axhline(_BOX_H_MM, color="#445", linewidth=0.6)
+        ax.set_ylim(-5, _BOX_H_MM + 5)
+        ax.set_xlim(t[0], 0)
+        ax.set_ylabel("marble 0  y [mm]", color=C_MUTED, fontsize=7)
         ax.set_xlabel("time [s]", color=C_MUTED, fontsize=7)
 
     # ------------------------------------------------------------------

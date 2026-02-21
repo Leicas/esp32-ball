@@ -24,7 +24,8 @@
       "Bash(timeout:*)",
       "Bash(PYTHONIOENCODING=utf-8 \"$HOME/.platformio/python3/python.exe\":*)",
       "Bash(PYTHONIOENCODING=utf-8 \"C:/Users/antoi/.platformio/penv/Scripts/pio.exe\" run:*)",
-      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python:*)"
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python:*)",
+      "Bash(~/.platformio/penv/Scripts/pio run -e hbridge)"
     ]
   }
 }
