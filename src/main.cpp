@@ -94,6 +94,10 @@ static void taskPhysics(void * /*param*/)
             telem_grav_y = imu_lin_accel_y / 9.8f;
             telem_grav_z = (imu_lin_accel_z + imu_grav_z) / 9.8f;
             telem_impact_energy = fminf(impact / MARBLE_IMPACT_REF, 1.0f);
+            telem_qw = imu_qw;
+            telem_qx = imu_qx;
+            telem_qy = imu_qy;
+            telem_qz = imu_qz;
         }
         else
         {

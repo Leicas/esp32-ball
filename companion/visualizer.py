@@ -14,7 +14,8 @@ Transport selection (positional argument):
 BLE GATT layout (firmware):
     Service  UUID : 19b10000-e8f2-537e-4f6c-d104768a1214
     Telemetry     : 19b10001-...  NOTIFY   float32[3]: sin_alpha, x_mm, v_mps (tube)
-                                           OR float32[22]: grav_x/y/z, impact, 6x(x,y,z) (marbles)
+                                           OR float32[?]: grav_x/y/z, impact, phys_hz,
+                                                         quat(w,x,y,z), 3x(x,y,z) (marbles)
     Command       : 19b10002-...  WRITE    1 ASCII byte: r/s/m/+/-/?
     Status        : 19b10003-...  READ+NOTIFY  ASCII "MODE,cavity_mm"
 
@@ -109,10 +110,24 @@ C_WALL = "#3a5060"
 # ---------------------------------------------------------------------------
 
 _MARBLE_COUNT = 3
-_BOX_W_MM = 120.0
-_BOX_H_MM = 80.0
-_BOX_D_MM = 80.0
-_MARBLE_RAD_MM = 8.0
+_BOX_W_MM = 50.0
+_BOX_H_MM = 25.0
+_BOX_D_MM = 25.0
+_MARBLE_RAD_MM = 1.0  # 2mm diameter
+
+
+def _normalize_quat(qw, qx, qy, qz):
+    n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if n < 1e-6:
+        return 1.0, 0.0, 0.0, 0.0
+    inv = 1.0 / n
+    return qw * inv, qx * inv, qy * inv, qz * inv
+
+
+def _quat_rotate(points, qw, qx, qy, qz):
+    q_vec = np.array([qx, qy, qz], dtype=np.float32)
+    t = 2.0 * np.cross(q_vec, points)
+    return points + qw * t + np.cross(q_vec, t)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +181,10 @@ class Visualizer:
         self.grav_x: float = 0.0
         self.grav_y: float = 0.0
         self.grav_z: float = 0.0
+        self.qw: float = 1.0
+        self.qx: float = 0.0
+        self.qy: float = 0.0
+        self.qz: float = 0.0
         self.impact_energy: float = 0.0
         self._marble_impact_flash: int = 0
 
@@ -218,12 +237,16 @@ class Visualizer:
         if cavity_mm is not None:
             self.cavity_mm = cavity_mm
 
-    def _on_telem_marble(self, grav_x, grav_y, grav_z, impact_e, positions):
+    def _on_telem_marble(self, grav_x, grav_y, grav_z, impact_e, positions, quat=None):
         self.grav_x = grav_x
         self.grav_y = grav_y
         self.grav_z = grav_z
         self.impact_energy = impact_e
         self.marbles = positions
+        if quat is not None:
+            self.qw, self.qx, self.qy, self.qz = _normalize_quat(*quat)
+        else:
+            self.qw, self.qx, self.qy, self.qz = 1.0, 0.0, 0.0, 0.0
         self.marble_mode = True
         self.mode = "MARBLES"
         if positions:
@@ -246,15 +269,28 @@ class Visualizer:
                     pass
         elif line.startswith("@"):
             parts = line[1:].split(",")
-            expected = 4 + _MARBLE_COUNT * 3
-            if len(parts) == expected:
+            expected_new = 8 + _MARBLE_COUNT * 3
+            expected_old = 4 + _MARBLE_COUNT * 3
+            if len(parts) in (expected_new, expected_old):
                 try:
                     vals = list(map(float, parts))
+                    if len(parts) == expected_new:
+                        quat = (vals[4], vals[5], vals[6], vals[7])
+                        pos_offset = 8
+                    else:
+                        quat = None
+                        pos_offset = 4
                     positions = [
-                        (vals[4 + i * 3], vals[4 + i * 3 + 1], vals[4 + i * 3 + 2])
+                        (
+                            vals[pos_offset + i * 3],
+                            vals[pos_offset + i * 3 + 1],
+                            vals[pos_offset + i * 3 + 2],
+                        )
                         for i in range(_MARBLE_COUNT)
                     ]
-                    self._on_telem_marble(vals[0], vals[1], vals[2], vals[3], positions)
+                    self._on_telem_marble(
+                        vals[0], vals[1], vals[2], vals[3], positions, quat
+                    )
                 except ValueError:
                     pass
         elif line.startswith("#"):
@@ -385,7 +421,17 @@ class Visualizer:
             # Legacy tube mode: 3 floats (sin_alpha, x_mm, v_mps)
             elif len(data) == 12:
                 self._on_telem(*struct.unpack_from("<fff", data))
-            # Marble mode: 5 header floats + MARBLE_COUNT * 3 position floats
+            # Marble mode: 9 header floats + MARBLE_COUNT * 3 position floats
+            elif len(data) == 4 * (9 + _MARBLE_COUNT * 3):
+                vals = struct.unpack_from(f"<{9 + _MARBLE_COUNT * 3}f", data)
+                positions = [
+                    (vals[9 + i * 3], vals[9 + i * 3 + 1], vals[9 + i * 3 + 2])
+                    for i in range(_MARBLE_COUNT)
+                ]
+                quat = (vals[5], vals[6], vals[7], vals[8])
+                self._on_telem_marble(vals[0], vals[1], vals[2], vals[3], positions, quat)
+                self.phys_hz = int(vals[4])
+            # Legacy marble mode: 5 header floats + MARBLE_COUNT * 3 position floats
             elif len(data) == 4 * (5 + _MARBLE_COUNT * 3):
                 vals = struct.unpack_from(f"<{5 + _MARBLE_COUNT * 3}f", data)
                 positions = [
@@ -848,6 +894,8 @@ class Visualizer:
         ax.grid(False)
 
         W, H, D, R = _BOX_W_MM, _BOX_H_MM, _BOX_D_MM, _MARBLE_RAD_MM
+        qw, qx, qy, qz = self.qw, self.qx, self.qy, self.qz
+        center = np.array([W / 2, H / 2, D / 2], dtype=np.float32)
 
         # Draw 3D box wireframe
         vertices = np.array(
@@ -863,14 +911,17 @@ class Visualizer:
             ]
         )
 
+        # Rotate box to match game orientation
+        rot_vertices = _quat_rotate(vertices - center, qw, qx, qy, qz) + center
+
         # Define the 6 faces of the box
         faces = [
-            [vertices[0], vertices[1], vertices[2], vertices[3]],  # front
-            [vertices[4], vertices[5], vertices[6], vertices[7]],  # back
-            [vertices[0], vertices[1], vertices[5], vertices[4]],  # bottom
-            [vertices[2], vertices[3], vertices[7], vertices[6]],  # top
-            [vertices[0], vertices[3], vertices[7], vertices[4]],  # left
-            [vertices[1], vertices[2], vertices[6], vertices[5]],  # right
+            [rot_vertices[0], rot_vertices[1], rot_vertices[2], rot_vertices[3]],
+            [rot_vertices[4], rot_vertices[5], rot_vertices[6], rot_vertices[7]],
+            [rot_vertices[0], rot_vertices[1], rot_vertices[5], rot_vertices[4]],
+            [rot_vertices[2], rot_vertices[3], rot_vertices[7], rot_vertices[6]],
+            [rot_vertices[0], rot_vertices[3], rot_vertices[7], rot_vertices[4]],
+            [rot_vertices[1], rot_vertices[2], rot_vertices[6], rot_vertices[5]],
         ]
 
         box = Poly3DCollection(
@@ -895,10 +946,12 @@ class Visualizer:
         sphere_z = R * np.outer(np.ones(np.size(u)), np.cos(v))
 
         for mx, my, mz in self.marbles:
+            m = np.array([mx, my, mz], dtype=np.float32)
+            m = _quat_rotate(m - center, qw, qx, qy, qz) + center
             ax.plot_surface(
-                sphere_x + mx,
-                sphere_y + my,
-                sphere_z + mz,
+                sphere_x + m[0],
+                sphere_y + m[1],
+                sphere_z + m[2],
                 color=C_BLUE,
                 alpha=0.92,
                 edgecolor="#ffffff88",
@@ -908,25 +961,28 @@ class Visualizer:
 
         # Gravity arrow (3D arrow from center bottom)
         arrow_len = 25.0
-        cx, cy, cz = W / 2, H / 2, 0
-        gx_a = self.grav_x * arrow_len
-        gy_a = self.grav_y * arrow_len
-        gz_a = self.grav_z * arrow_len
+        base = np.array([W / 2, H / 2, 0], dtype=np.float32)
+        g_vec = np.array(
+            [self.grav_x * arrow_len, self.grav_y * arrow_len, self.grav_z * arrow_len],
+            dtype=np.float32,
+        )
+        base = _quat_rotate(base - center, qw, qx, qy, qz) + center
+        g_vec = _quat_rotate(g_vec, qw, qx, qy, qz)
         ax.quiver(
-            cx,
-            cy,
-            cz,
-            gx_a,
-            gy_a,
-            gz_a,
+            base[0],
+            base[1],
+            base[2],
+            g_vec[0],
+            g_vec[1],
+            g_vec[2],
             color="#ffcc44",
             arrow_length_ratio=0.3,
             linewidth=2,
         )
         ax.text(
-            cx + gx_a * 1.3,
-            cy + gy_a * 1.3,
-            cz + gz_a * 1.3,
+            base[0] + g_vec[0] * 1.3,
+            base[1] + g_vec[1] * 1.3,
+            base[2] + g_vec[2] * 1.3,
             "a",
             color="#ffcc44",
             fontsize=10,
@@ -934,10 +990,13 @@ class Visualizer:
         )
 
         # Set equal aspect ratio and limits
-        ax.set_xlim([-10, W + 10])
-        ax.set_ylim([-10, H + 10])
-        ax.set_zlim([-10, D + 10])
-        ax.set_box_aspect([W, H, D])
+        mins = rot_vertices.min(axis=0)
+        maxs = rot_vertices.max(axis=0)
+        margin = 8.0
+        ax.set_xlim([mins[0] - margin, maxs[0] + margin])
+        ax.set_ylim([mins[1] - margin, maxs[1] + margin])
+        ax.set_zlim([mins[2] - margin, maxs[2] + margin])
+        ax.set_box_aspect([maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2]])
 
         # Labels
         ax.set_xlabel("X [mm]", color=C_MUTED, fontsize=8)

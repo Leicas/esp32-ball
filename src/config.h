@@ -28,10 +28,10 @@ static constexpr float HAPTIC_IMPACT_REF = 3.0f; // speed [m/s] → full impact 
 // ─────────────────────────────────────────────────────────────────────────────
 
 static constexpr int MARBLE_COUNT = 3;
-static constexpr float MARBLE_BOX_W = 0.120f;      // box width  [m] (X)
-static constexpr float MARBLE_BOX_H = 0.080f;      // box height [m] (Y)
-static constexpr float MARBLE_BOX_D = 0.080f;      // box depth  [m] (Z)
-static constexpr float MARBLE_RAD = 0.008f;        // marble radius [m]
+static constexpr float MARBLE_BOX_W = 0.050f;      // box width  [m] (X)
+static constexpr float MARBLE_BOX_H = 0.025f;      // box height [m] (Y)
+static constexpr float MARBLE_BOX_D = 0.025f;      // box depth  [m] (Z)
+static constexpr float MARBLE_RAD = 0.001f;        // marble radius [m] (2mm diameter)
 static constexpr float MARBLE_RESTITUTION = 0.70f; // bounce coefficient
 static constexpr float MARBLE_IMPACT_REF = 0.50f;  // speed [m/s] → full haptic amplitude
 

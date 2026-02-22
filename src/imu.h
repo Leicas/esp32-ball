@@ -16,3 +16,7 @@ extern volatile float imu_lin_accel_y; // tube linear acceleration Y [m/s²]
 extern volatile float imu_lin_accel_z; // tube linear acceleration Z [m/s²]
 extern volatile float imu_grav_y;      // raw gravity Y [m/s²]
 extern volatile float imu_grav_z;      // raw gravity Z [m/s²]
+extern volatile float imu_qw;          // game rotation vector quaternion w
+extern volatile float imu_qx;          // game rotation vector quaternion x
+extern volatile float imu_qy;          // game rotation vector quaternion y
+extern volatile float imu_qz;          // game rotation vector quaternion z

@@ -13,6 +13,10 @@ volatile float imu_lin_accel_y = 0.0f;
 volatile float imu_lin_accel_z = 0.0f;
 volatile float imu_grav_y = 0.0f;
 volatile float imu_grav_z = 0.0f;
+volatile float imu_qw = 1.0f;
+volatile float imu_qx = 0.0f;
+volatile float imu_qy = 0.0f;
+volatile float imu_qz = 0.0f;
 
 static void enableReports()
 {
@@ -20,6 +24,8 @@ static void enableReports()
         Serial.println("# imu: gravity report failed");
     if (!s_bno.enableReport(SH2_LINEAR_ACCELERATION, 1000))
         Serial.println("# imu: linear-accel report failed");
+    if (!s_bno.enableReport(SH2_GAME_ROTATION_VECTOR, 1000))
+        Serial.println("# imu: game-rotation report failed");
 }
 
 bool imuInit(TwoWire &wire)
@@ -66,6 +72,12 @@ void imuUpdate()
             imu_lin_accel_x = s_sv.un.linearAcceleration.x;
             imu_lin_accel_y = s_sv.un.linearAcceleration.y;
             imu_lin_accel_z = s_sv.un.linearAcceleration.z;
+            break;
+        case SH2_GAME_ROTATION_VECTOR:
+            imu_qw = s_sv.un.gameRotationVector.real;
+            imu_qx = s_sv.un.gameRotationVector.i;
+            imu_qy = s_sv.un.gameRotationVector.j;
+            imu_qz = s_sv.un.gameRotationVector.k;
             break;
         }
     }

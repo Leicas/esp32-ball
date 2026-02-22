@@ -16,6 +16,10 @@ volatile float telem_grav_x = 0.0f;
 volatile float telem_grav_y = 0.0f;
 volatile float telem_grav_z = 0.0f;
 volatile float telem_impact_energy = 0.0f;
+volatile float telem_qw = 1.0f;
+volatile float telem_qx = 0.0f;
+volatile float telem_qy = 0.0f;
+volatile float telem_qz = 0.0f;
 
 static const char *modeStr()
 {
@@ -197,11 +201,15 @@ void commsSendStatus()
 void commsStreamMarbles()
 {
     char buf[256];
-    int n = snprintf(buf, sizeof(buf), "@%+.3f,%+.3f,%+.3f,%.3f",
+    int n = snprintf(buf, sizeof(buf), "@%+.3f,%+.3f,%+.3f,%.3f,%.5f,%.5f,%.5f,%.5f",
                      (float)telem_grav_x,
                      (float)telem_grav_y,
                      (float)telem_grav_z,
-                     (float)telem_impact_energy);
+                     (float)telem_impact_energy,
+                     (float)telem_qw,
+                     (float)telem_qx,
+                     (float)telem_qy,
+                     (float)telem_qz);
     for (int i = 0; i < MARBLE_COUNT; i++)
     {
         n += snprintf(buf + n, (int)sizeof(buf) - n,
@@ -213,21 +221,25 @@ void commsStreamMarbles()
     snprintf(buf + n, (int)sizeof(buf) - n, "\n");
     Serial.print(buf);
 
-    // BLE: send marble data (5 header floats + MARBLE_COUNT × 3 position floats)
+    // BLE: send marble data (9 header floats + MARBLE_COUNT × 3 position floats)
     if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem)
     {
-        const int float_count = 5 + MARBLE_COUNT * 3;
+        const int float_count = 9 + MARBLE_COUNT * 3;
         float pkt[float_count];
         pkt[0] = telem_grav_x;
         pkt[1] = telem_grav_y;
         pkt[2] = telem_grav_z;
         pkt[3] = telem_impact_energy;
         pkt[4] = (float)telem_phys_hz;
+        pkt[5] = telem_qw;
+        pkt[6] = telem_qx;
+        pkt[7] = telem_qy;
+        pkt[8] = telem_qz;
         for (int i = 0; i < MARBLE_COUNT; i++)
         {
-            pkt[5 + i * 3 + 0] = g_marbles[i].x * 1000.0f;
-            pkt[5 + i * 3 + 1] = g_marbles[i].y * 1000.0f;
-            pkt[5 + i * 3 + 2] = g_marbles[i].z * 1000.0f;
+            pkt[9 + i * 3 + 0] = g_marbles[i].x * 1000.0f;
+            pkt[9 + i * 3 + 1] = g_marbles[i].y * 1000.0f;
+            pkt[9 + i * 3 + 2] = g_marbles[i].z * 1000.0f;
         }
         s_ble_telem->setValue((uint8_t *)pkt, sizeof(pkt));
         s_ble_telem->notify();
