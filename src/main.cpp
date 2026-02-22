@@ -34,7 +34,7 @@
 #include "marbles.h"
 
 #ifdef HBRIDGE
-#include "driver/gpio.h"  // gpio_hold_dis
+#include "driver/gpio.h" // gpio_hold_dis
 #endif
 
 #ifndef HBRIDGE
@@ -48,60 +48,79 @@ static void neoSet(uint8_t r, uint8_t g, uint8_t b)
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IMU task  —  priority 3, reads BNO085 as fast as possible (I2C is slow)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void taskIMU(void * /*param*/)
+{
+    for (;;)
+    {
+        imuUpdate();   // updates volatile globals
+        vTaskDelay(1); // yield every 1ms, actual rate depends on I2C speed
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Physics task  —  priority 5, 1 kHz via vTaskDelayUntil
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void taskPhysics(void * /*param*/)
 {
     TickType_t xLastWake = xTaskGetTickCount();
-    const TickType_t kPeriod = pdMS_TO_TICKS(1); // 1 tick = 1 ms
+    const TickType_t kPeriod = pdMS_TO_TICKS(1); // 1 tick = 1 ms (1000 Hz)
 
-    uint32_t step_count   = 0;
-    TickType_t hz_last    = xTaskGetTickCount();
+    uint32_t step_count = 0;
+    uint32_t hz_last_us = micros(); // use microseconds for precision
 
-    for (;;) {
-        // 1. Read IMU
-        imuUpdate();
+    for (;;)
+    {
+        // 1. IMU data is read by separate task, just use latest values
 
-        if (g_sim_mode == SimMode::MARBLES) {
-            // 2a. Marble box physics (box acceleration + gravity)
+        if (g_sim_mode == SimMode::MARBLES)
+        {
+            // 2. Marble box physics (box acceleration + gravity)
             float impact = marblesStep(PHYS_H,
-                                       imu_lin_accel_x,  // box acceleration X [m/s²]
-                                       imu_lin_accel_y,  // box acceleration Y [m/s²]
-                                       imu_lin_accel_z,  // box acceleration Z [m/s²]
-                                       imu_grav_z);      // gravity Z [m/s²]
+                                       imu_lin_accel_x, // box acceleration X [m/s²]
+                                       imu_lin_accel_y, // box acceleration Y [m/s²]
+                                       imu_lin_accel_z, // box acceleration Z [m/s²]
+                                       imu_grav_z);     // gravity Z [m/s²]
 
-            // 3a. Haptic — scale marble impact speed to tube haptic reference
+            // 3. Haptic — scale marble impact speed to tube haptic reference
             hapticUpdate(0.0f, 0.0f, false,
                          impact * (HAPTIC_IMPACT_REF / MARBLE_IMPACT_REF));
 
-            // 4a. Telemetry snapshot for marble stream
-            telem_grav_x        = imu_lin_accel_x / 9.8f;  // normalize for display
-            telem_grav_y        = imu_lin_accel_y / 9.8f;
-            telem_grav_z        = (imu_lin_accel_z + imu_grav_z) / 9.8f;
+            // 4. Telemetry snapshot for marble stream
+            telem_grav_x = imu_lin_accel_x / 9.8f; // normalize for display
+            telem_grav_y = imu_lin_accel_y / 9.8f;
+            telem_grav_z = (imu_lin_accel_z + imu_grav_z) / 9.8f;
             telem_impact_energy = fminf(impact / MARBLE_IMPACT_REF, 1.0f);
-        } else {
-            // 2b. Tube physics step
+        }
+        else
+        {
+            // 2. Tube physics step
             ImpactInfo impact = physicsStep(PHYS_H, imu_sin_alpha, imu_lin_accel_x);
 
-            // 3b. Haptic — amplitude scales with impact energy
+            // 3. Haptic — amplitude scales with impact energy
             hapticUpdate(phys_x_pos, phys_x_vel,
                          g_sim_mode == SimMode::ROLLING,
                          impact.hit ? impact.speed : 0.0f);
 
-            // 4b. Publish telemetry snapshot for comms task
+            // 4. Publish telemetry snapshot for comms task
             telem_sin_alpha = imu_sin_alpha;
-            telem_x_mm      = phys_x_pos * 1000.0f;
-            telem_x_vel     = phys_x_vel;
+            telem_x_mm = phys_x_pos * 1000.0f;
+            telem_x_vel = phys_x_vel;
         }
 
-        // 5. Measure actual physics rate (updated every second)
+        // 5. Measure actual physics rate (updated every second using microseconds)
         step_count++;
-        TickType_t now_tick = xTaskGetTickCount();
-        if (now_tick - hz_last >= pdMS_TO_TICKS(1000)) {
-            telem_phys_hz = step_count;
-            step_count    = 0;
-            hz_last       = now_tick;
+        uint32_t now_us = micros();
+        uint32_t elapsed_us = now_us - hz_last_us;
+        if (elapsed_us >= 1000000) // 1 second in microseconds
+        {
+            // Calculate actual Hz with fractional precision
+            telem_phys_hz = (step_count * 1000000UL) / elapsed_us;
+            step_count = 0;
+            hz_last_us = now_us;
         }
 
         vTaskDelayUntil(&xLastWake, kPeriod);
@@ -117,12 +136,14 @@ static void taskComms(void * /*param*/)
     uint32_t last_telem_ms = 0;
     uint32_t last_debug_ms = 0;
 
-    for (;;) {
+    for (;;)
+    {
         uint32_t now = millis();
 
         commsHandleSerial();
 
-        if (now - last_telem_ms >= TELEM_PERIOD_MS) {
+        if (now - last_telem_ms >= TELEM_PERIOD_MS)
+        {
             if (g_sim_mode == SimMode::MARBLES)
                 commsStreamMarbles();
             else
@@ -130,7 +151,8 @@ static void taskComms(void * /*param*/)
             last_telem_ms = now;
         }
 
-        if (now - last_debug_ms >= DEBUG_PERIOD_MS) {
+        if (now - last_debug_ms >= DEBUG_PERIOD_MS)
+        {
             commsSendStatus();
             last_debug_ms = now;
         }
@@ -148,7 +170,8 @@ void setup()
     Serial.begin(115200);
     {
         uint32_t t0 = millis();
-        while (!Serial && millis() - t0 < 3000) delay(10);
+        while (!Serial && millis() - t0 < 3000)
+            delay(10);
     }
 
 #ifndef HBRIDGE
@@ -181,20 +204,22 @@ void setup()
 
     // ── IMU ──────────────────────────────────────────────────────────────────
     Serial.println("# imu: init BNO085 …");
-    if (!imuInit(Wire)) {
+    if (!imuInit(Wire))
+    {
         Serial.println("# imu: FAILED — check wiring!");
 #ifndef HBRIDGE
         neoSet(64, 0, 0); // red = fatal
 #endif
-        while (1) delay(10);
+        while (1)
+            delay(10);
     }
     Serial.println("# imu: ok");
 
     // ── Init modules ─────────────────────────────────────────────────────────
     physicsInit();
     marblesInit();
-    hapticInit();  // configures LEDC (HBRIDGE) or I2S channel (feather)
-    commsInit();   // serial + BLE
+    hapticInit(); // configures LEDC (HBRIDGE) or I2S channel (feather)
+    commsInit();  // serial + BLE
 
     // ── Banner ───────────────────────────────────────────────────────────────
     Serial.println("\n================================");
@@ -207,8 +232,8 @@ void setup()
     );
     Serial.println("================================");
     Serial.printf("# mode=%s  cavity_mm=%.0f  rebound=%d  G=%.1f  mu=%.2f\n",
-                  g_sim_mode == SimMode::ROLLING ? "ROLLING" :
-                  g_sim_mode == SimMode::SLIDING ? "SLIDING" : "MARBLES",
+                  g_sim_mode == SimMode::ROLLING ? "ROLLING" : g_sim_mode == SimMode::SLIDING ? "SLIDING"
+                                                                                              : "MARBLES",
                   g_cavity * 1000.0f, g_rebound ? 1 : 0, G_FACTOR, FRICTION_MU);
     Serial.printf("# physics=%d Hz  telem=%lu Hz\n",
                   PHYS_HZ, 1000UL / TELEM_PERIOD_MS);
@@ -222,8 +247,9 @@ void setup()
     // loop() doesn't trigger the 10-second watchdog reset.
     esp_task_wdt_delete(NULL);
 
+    xTaskCreate(taskIMU, "imu", 4096, nullptr, 3, nullptr);
     xTaskCreate(taskPhysics, "physics", 8192, nullptr, 5, nullptr);
-    xTaskCreate(taskComms,   "comms",   8192, nullptr, 1, nullptr);
+    xTaskCreate(taskComms, "comms", 8192, nullptr, 1, nullptr);
 }
 
 void loop() { vTaskDelay(portMAX_DELAY); }

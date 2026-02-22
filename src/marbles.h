@@ -1,7 +1,10 @@
 #pragma once
 #include "config.h"
 
-struct Marble { float x, y, z, vx, vy, vz; };
+struct Marble
+{
+    float x, y, z, vx, vy, vz;
+};
 
 // All marble positions and velocities (written by physics task)
 extern Marble g_marbles[MARBLE_COUNT];

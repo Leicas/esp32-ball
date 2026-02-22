@@ -8,49 +8,53 @@
 #include <BLEServer.h>
 
 // ── Telemetry snapshot (defined here, extern'd in comms.h) ───────────────────
-volatile float    telem_sin_alpha     = 0.0f;
-volatile float    telem_x_mm         = 0.0f;
-volatile float    telem_x_vel        = 0.0f;
-volatile uint32_t telem_phys_hz      = 0;
-volatile float    telem_grav_x       = 0.0f;
-volatile float    telem_grav_y       = 0.0f;
-volatile float    telem_grav_z       = 0.0f;
-volatile float    telem_impact_energy = 0.0f;
+volatile float telem_sin_alpha = 0.0f;
+volatile float telem_x_mm = 0.0f;
+volatile float telem_x_vel = 0.0f;
+volatile uint32_t telem_phys_hz = PHYS_HZ; // initialize to expected value
+volatile float telem_grav_x = 0.0f;
+volatile float telem_grav_y = 0.0f;
+volatile float telem_grav_z = 0.0f;
+volatile float telem_impact_energy = 0.0f;
 
 static const char *modeStr()
 {
-    if (g_sim_mode == SimMode::ROLLING) return "ROLLING";
-    if (g_sim_mode == SimMode::SLIDING) return "SLIDING";
+    if (g_sim_mode == SimMode::ROLLING)
+        return "ROLLING";
+    if (g_sim_mode == SimMode::SLIDING)
+        return "SLIDING";
     return "MARBLES";
 }
 
 // ── BLE UUIDs ─────────────────────────────────────────────────────────────────
-static const char *BLE_DEV_NAME  = "RollingStone";
-static const char *BLE_SVC_UUID  = "19b10000-e8f2-537e-4f6c-d104768a1214";
-static const char *BLE_TELEM_UUID= "19b10001-e8f2-537e-4f6c-d104768a1214";
-static const char *BLE_CMD_UUID  = "19b10002-e8f2-537e-4f6c-d104768a1214";
+static const char *BLE_DEV_NAME = "RollingStone";
+static const char *BLE_SVC_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+static const char *BLE_TELEM_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214";
+static const char *BLE_CMD_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214";
 static const char *BLE_STAT_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214";
 
-static BLEServer         *s_ble_server = nullptr;
-static BLECharacteristic *s_ble_telem  = nullptr;
-static BLECharacteristic *s_ble_stat   = nullptr;
-
+static BLEServer *s_ble_server = nullptr;
+static BLECharacteristic *s_ble_telem = nullptr;
+static BLECharacteristic *s_ble_stat = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void bleSendStatus()
 {
-    if (!s_ble_stat) return;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s,%.0f,rebound=%d",
-             modeStr(), g_cavity * 1000.0f, g_rebound ? 1 : 0);
+    if (!s_ble_stat)
+        return;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "%s,%.0f,rebound=%d,phys_hz=%lu",
+             modeStr(), g_cavity * 1000.0f, g_rebound ? 1 : 0,
+             (unsigned long)telem_phys_hz);
     s_ble_stat->setValue(buf);
     s_ble_stat->notify();
 }
 
 static void clampPosition()
 {
-    if (phys_x_pos > g_cavity) {
+    if (phys_x_pos > g_cavity)
+    {
         phys_x_pos = g_cavity;
         phys_x_vel = 0.0f;
     }
@@ -58,7 +62,8 @@ static void clampPosition()
 
 static void handleCommand(char c)
 {
-    switch (c) {
+    switch (c)
+    {
     case 'r':
         g_sim_mode = SimMode::ROLLING;
         Serial.println("# mode=ROLLING");
@@ -101,14 +106,18 @@ static void handleCommand(char c)
 
 // ── BLE callbacks ─────────────────────────────────────────────────────────────
 
-class BleServerCB : public BLEServerCallbacks {
+class BleServerCB : public BLEServerCallbacks
+{
     void onDisconnect(BLEServer *) override { BLEDevice::startAdvertising(); }
 };
 
-class BleCmdCB : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *chr) override {
+class BleCmdCB : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *chr) override
+    {
         String v = chr->getValue();
-        if (v.length() > 0) handleCommand(v.charAt(0));
+        if (v.length() > 0)
+            handleCommand(v.charAt(0));
     }
 };
 
@@ -158,9 +167,10 @@ void commsStreamTelemetry()
                   (float)telem_x_mm,
                   (float)telem_x_vel);
 
-    // BLE: float32[3] packed little-endian
-    if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem) {
-        float pkt[3] = {telem_sin_alpha, telem_x_mm, telem_x_vel};
+    // BLE: float32[4] packed little-endian (added phys_hz)
+    if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem)
+    {
+        float pkt[4] = {telem_sin_alpha, telem_x_mm, telem_x_vel, (float)telem_phys_hz};
         s_ble_telem->setValue((uint8_t *)pkt, sizeof(pkt));
         s_ble_telem->notify();
     }
@@ -168,11 +178,14 @@ void commsStreamTelemetry()
 
 void commsSendStatus()
 {
-    if (g_sim_mode == SimMode::MARBLES) {
+    if (g_sim_mode == SimMode::MARBLES)
+    {
         Serial.printf("# grav_x=%+.3f  grav_y=%+.3f  grav_z=%+.3f  phys_hz=%lu  mode=%s\n",
                       (float)telem_grav_x, (float)telem_grav_y, (float)telem_grav_z,
                       (uint32_t)telem_phys_hz, modeStr());
-    } else {
+    }
+    else
+    {
         Serial.printf("# sin_a=%+.3f  x_mm=%.1f  v_mps=%+.4f  phys_hz=%lu  mode=%s  cavity_mm=%.0f  rebound=%d\n",
                       (float)telem_sin_alpha, (float)telem_x_mm, (float)telem_x_vel,
                       (uint32_t)telem_phys_hz, modeStr(),
@@ -189,7 +202,8 @@ void commsStreamMarbles()
                      (float)telem_grav_y,
                      (float)telem_grav_z,
                      (float)telem_impact_energy);
-    for (int i = 0; i < MARBLE_COUNT; i++) {
+    for (int i = 0; i < MARBLE_COUNT; i++)
+    {
         n += snprintf(buf + n, (int)sizeof(buf) - n,
                       ",%.1f,%.1f,%.1f",
                       g_marbles[i].x * 1000.0f,
@@ -199,18 +213,21 @@ void commsStreamMarbles()
     snprintf(buf + n, (int)sizeof(buf) - n, "\n");
     Serial.print(buf);
 
-    // BLE: send marble data (4 header floats + MARBLE_COUNT × 3 position floats)
-    if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem) {
-        const int float_count = 4 + MARBLE_COUNT * 3;
+    // BLE: send marble data (5 header floats + MARBLE_COUNT × 3 position floats)
+    if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem)
+    {
+        const int float_count = 5 + MARBLE_COUNT * 3;
         float pkt[float_count];
         pkt[0] = telem_grav_x;
         pkt[1] = telem_grav_y;
         pkt[2] = telem_grav_z;
         pkt[3] = telem_impact_energy;
-        for (int i = 0; i < MARBLE_COUNT; i++) {
-            pkt[4 + i * 3 + 0] = g_marbles[i].x * 1000.0f;
-            pkt[4 + i * 3 + 1] = g_marbles[i].y * 1000.0f;
-            pkt[4 + i * 3 + 2] = g_marbles[i].z * 1000.0f;
+        pkt[4] = (float)telem_phys_hz;
+        for (int i = 0; i < MARBLE_COUNT; i++)
+        {
+            pkt[5 + i * 3 + 0] = g_marbles[i].x * 1000.0f;
+            pkt[5 + i * 3 + 1] = g_marbles[i].y * 1000.0f;
+            pkt[5 + i * 3 + 2] = g_marbles[i].z * 1000.0f;
         }
         s_ble_telem->setValue((uint8_t *)pkt, sizeof(pkt));
         s_ble_telem->notify();

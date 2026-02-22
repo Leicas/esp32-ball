@@ -108,11 +108,11 @@ C_WALL = "#3a5060"
 # Marble box constants  (must match firmware config.h)
 # ---------------------------------------------------------------------------
 
-_MARBLE_COUNT  = 3
-_BOX_W_MM      = 120.0
-_BOX_H_MM      =  80.0
-_BOX_D_MM      =  80.0
-_MARBLE_RAD_MM =   8.0
+_MARBLE_COUNT = 3
+_BOX_W_MM = 120.0
+_BOX_H_MM = 80.0
+_BOX_D_MM = 80.0
+_MARBLE_RAD_MM = 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +160,9 @@ class Visualizer:
 
         # ── Marble mode state ──────────────────────────────────────────────
         self.marble_mode: bool = False
-        self.marbles: list = [(_BOX_W_MM / 2, _BOX_H_MM / 2, _BOX_D_MM / 2)] * _MARBLE_COUNT
+        self.marbles: list = [
+            (_BOX_W_MM / 2, _BOX_H_MM / 2, _BOX_D_MM / 2)
+        ] * _MARBLE_COUNT
         self.grav_x: float = 0.0
         self.grav_y: float = 0.0
         self.grav_z: float = 0.0
@@ -212,7 +214,7 @@ class Visualizer:
     def _on_status(self, mode: str | None, cavity_mm: float | None):
         if mode:
             self.mode = mode
-            self.marble_mode = (mode == "MARBLES")
+            self.marble_mode = mode == "MARBLES"
         if cavity_mm is not None:
             self.cavity_mm = cavity_mm
 
@@ -375,24 +377,41 @@ class Visualizer:
 
     def _on_ble_telem(self, _sender, data: bytearray):
         if len(data) >= 12:
-            # Tube mode: 3 floats (sin_alpha, x_mm, v_mps)
-            if len(data) == 12:
+            # Tube mode: 4 floats (sin_alpha, x_mm, v_mps, phys_hz)
+            if len(data) == 16:
+                vals = struct.unpack_from("<ffff", data)
+                self._on_telem(vals[0], vals[1], vals[2])
+                self.phys_hz = int(vals[3])
+            # Legacy tube mode: 3 floats (sin_alpha, x_mm, v_mps)
+            elif len(data) == 12:
                 self._on_telem(*struct.unpack_from("<fff", data))
-            # Marble mode: 4 header floats + MARBLE_COUNT * 3 position floats
-            elif len(data) == 4 * (4 + _MARBLE_COUNT * 3):
-                vals = struct.unpack_from(f"<{4 + _MARBLE_COUNT * 3}f", data)
+            # Marble mode: 5 header floats + MARBLE_COUNT * 3 position floats
+            elif len(data) == 4 * (5 + _MARBLE_COUNT * 3):
+                vals = struct.unpack_from(f"<{5 + _MARBLE_COUNT * 3}f", data)
                 positions = [
-                    (vals[4 + i * 3], vals[4 + i * 3 + 1], vals[4 + i * 3 + 2])
+                    (vals[5 + i * 3], vals[5 + i * 3 + 1], vals[5 + i * 3 + 2])
                     for i in range(_MARBLE_COUNT)
                 ]
                 self._on_telem_marble(vals[0], vals[1], vals[2], vals[3], positions)
+                self.phys_hz = int(vals[4])
 
     def _on_ble_status(self, _sender, data: bytearray):
         try:
             text = bytes(data).decode("ascii").strip()
             parts = text.split(",")
-            mode = parts[0] if parts and parts[0] in ("ROLLING", "SLIDING", "MARBLES") else None
+            mode = (
+                parts[0]
+                if parts and parts[0] in ("ROLLING", "SLIDING", "MARBLES")
+                else None
+            )
             cav = float(parts[1]) if len(parts) >= 2 else None
+            # Parse phys_hz from status (format: "MODE,cavity,rebound=X,phys_hz=Y")
+            for part in parts:
+                if "phys_hz=" in part:
+                    try:
+                        self.phys_hz = int(part.split("=")[1])
+                    except (ValueError, IndexError):
+                        pass
             self._on_status(mode, cav)
         except (ValueError, UnicodeDecodeError):
             pass
@@ -549,9 +568,9 @@ class Visualizer:
         """Convert main axis to 3D if not already."""
         if not self.ax_is_3d:
             self.ax.remove()
-            self.ax = self.fig.add_axes([0.01, 0.12, 0.70, 0.80], 
-                                        facecolor=PANEL_BG, 
-                                        projection='3d')
+            self.ax = self.fig.add_axes(
+                [0.01, 0.12, 0.70, 0.80], facecolor=PANEL_BG, projection="3d"
+            )
             self.ax_is_3d = True
 
     def _ensure_2d_axis(self):
@@ -567,7 +586,9 @@ class Visualizer:
             self._stream.close()
 
     def _on_key(self, event):
-        cmd = {"r": b"r", "s": b"s", "m": b"m", "+": b"+", "=": b"+", "-": b"-"}.get(event.key)
+        cmd = {"r": b"r", "s": b"s", "m": b"m", "+": b"+", "=": b"+", "-": b"-"}.get(
+            event.key
+        )
         if cmd:
             self._send_cmd(cmd)
             if event.key == "m":
@@ -579,21 +600,25 @@ class Visualizer:
     # ------------------------------------------------------------------
     def _ensure_2d_axis(self):
         """Ensure main axis is 2D for tube mode."""
-        if hasattr(self.ax, 'zaxis'):
+        if hasattr(self.ax, "zaxis"):
             # Recreate as 2D axis
             pos = self.ax.get_position()
             self.ax.remove()
-            self.ax = self.fig.add_axes([pos.x0, pos.y0, pos.width, pos.height], 
-                                        facecolor=PANEL_BG)
+            self.ax = self.fig.add_axes(
+                [pos.x0, pos.y0, pos.width, pos.height], facecolor=PANEL_BG
+            )
 
     def _ensure_3d_axis(self):
         """Ensure main axis is 3D for marble mode."""
-        if not hasattr(self.ax, 'zaxis'):
+        if not hasattr(self.ax, "zaxis"):
             # Recreate as 3D axis
             pos = self.ax.get_position()
             self.ax.remove()
-            self.ax = self.fig.add_axes([pos.x0, pos.y0, pos.width, pos.height], 
-                                        projection='3d', facecolor=PANEL_BG)
+            self.ax = self.fig.add_axes(
+                [pos.x0, pos.y0, pos.width, pos.height],
+                projection="3d",
+                facecolor=PANEL_BG,
+            )
 
     # ------------------------------------------------------------------
     def _draw_frame(self):
@@ -749,17 +774,27 @@ class Visualizer:
             zorder=1,
         )
         ax.text(
-            1.75, -0.60, "g",
-            color="#667788", fontsize=9, ha="center", va="bottom",
+            1.75,
+            -0.60,
+            "g",
+            color="#667788",
+            fontsize=9,
+            ha="center",
+            va="bottom",
             fontfamily="monospace",
         )
 
         # Mode badge
         badge_col = C_BLUE if self.mode == "ROLLING" else C_GREEN
         ax.text(
-            -1.75, 1.15, f"◉ {self.mode}",
-            color=badge_col, fontsize=10, fontfamily="monospace",
-            fontweight="bold", va="top",
+            -1.75,
+            1.15,
+            f"◉ {self.mode}",
+            color=badge_col,
+            fontsize=10,
+            fontfamily="monospace",
+            fontweight="bold",
+            va="top",
         )
 
         # Connection indicator
@@ -767,9 +802,14 @@ class Visualizer:
         col = C_GREEN if self._connected else C_RED
         label = f"{self._conn_label} Connected" if self._connected else "Scanning…"
         ax.text(
-            0.55, 1.15, f"{sym} {label}",
-            color=col, fontsize=9, fontfamily="monospace",
-            ha="center", va="top",
+            0.55,
+            1.15,
+            f"{sym} {label}",
+            color=col,
+            fontsize=9,
+            fontfamily="monospace",
+            ha="center",
+            va="top",
         )
 
         # Physics Hz (colour-coded: green ≥900, yellow ≥700, red <700)
@@ -777,9 +817,14 @@ class Visualizer:
         if hz > 0:
             phz_col = C_GREEN if hz >= 900 else ("#ffcc44" if hz >= 700 else C_RED)
             ax.text(
-                -2.0, -1.33, f"⚡ {hz} / 1000 Hz",
-                color=phz_col, fontsize=9, fontfamily="monospace",
-                va="bottom", zorder=10,
+                -2.0,
+                -1.33,
+                f"⚡ {hz} / 1000 Hz",
+                color=phz_col,
+                fontsize=9,
+                fontfamily="monospace",
+                va="bottom",
+                zorder=10,
             )
 
         ax.set_xlim(-2.05, 2.05)
@@ -805,11 +850,19 @@ class Visualizer:
         W, H, D, R = _BOX_W_MM, _BOX_H_MM, _BOX_D_MM, _MARBLE_RAD_MM
 
         # Draw 3D box wireframe
-        vertices = np.array([
-            [0, 0, 0], [W, 0, 0], [W, H, 0], [0, H, 0],  # front face (z=0)
-            [0, 0, D], [W, 0, D], [W, H, D], [0, H, D],  # back face (z=D)
-        ])
-        
+        vertices = np.array(
+            [
+                [0, 0, 0],
+                [W, 0, 0],
+                [W, H, 0],
+                [0, H, 0],  # front face (z=0)
+                [0, 0, D],
+                [W, 0, D],
+                [W, H, D],
+                [0, H, D],  # back face (z=D)
+            ]
+        )
+
         # Define the 6 faces of the box
         faces = [
             [vertices[0], vertices[1], vertices[2], vertices[3]],  # front
@@ -819,17 +872,19 @@ class Visualizer:
             [vertices[0], vertices[3], vertices[7], vertices[4]],  # left
             [vertices[1], vertices[2], vertices[6], vertices[5]],  # right
         ]
-        
-        box = Poly3DCollection(faces, alpha=0.15, facecolor=C_TUBE, 
-                               edgecolor=C_MUTED, linewidths=1.5)
+
+        box = Poly3DCollection(
+            faces, alpha=0.15, facecolor=C_TUBE, edgecolor=C_MUTED, linewidths=1.5
+        )
         ax.add_collection3d(box)
 
         # Impact flash overlay (change alpha of box)
         if self._marble_impact_flash > 0:
             flash_alpha = self._marble_impact_flash / 8.0 * 0.5
             self._marble_impact_flash -= 1
-            flash_overlay = Poly3DCollection(faces, alpha=flash_alpha, 
-                                            facecolor=C_RED, edgecolor="none")
+            flash_overlay = Poly3DCollection(
+                faces, alpha=flash_alpha, facecolor=C_RED, edgecolor="none"
+            )
             ax.add_collection3d(flash_overlay)
 
         # Draw marbles as spheres
@@ -840,9 +895,16 @@ class Visualizer:
         sphere_z = R * np.outer(np.ones(np.size(u)), np.cos(v))
 
         for mx, my, mz in self.marbles:
-            ax.plot_surface(sphere_x + mx, sphere_y + my, sphere_z + mz,
-                          color=C_BLUE, alpha=0.92, edgecolor='#ffffff88', 
-                          linewidth=0.3, shade=True)
+            ax.plot_surface(
+                sphere_x + mx,
+                sphere_y + my,
+                sphere_z + mz,
+                color=C_BLUE,
+                alpha=0.92,
+                edgecolor="#ffffff88",
+                linewidth=0.3,
+                shade=True,
+            )
 
         # Gravity arrow (3D arrow from center bottom)
         arrow_len = 25.0
@@ -850,51 +912,80 @@ class Visualizer:
         gx_a = self.grav_x * arrow_len
         gy_a = self.grav_y * arrow_len
         gz_a = self.grav_z * arrow_len
-        ax.quiver(cx, cy, cz, gx_a, gy_a, gz_a,
-                 color='#ffcc44', arrow_length_ratio=0.3, linewidth=2)
-        ax.text(cx + gx_a * 1.3, cy + gy_a * 1.3, cz + gz_a * 1.3, "a",
-               color="#ffcc44", fontsize=10, fontfamily="monospace")
+        ax.quiver(
+            cx,
+            cy,
+            cz,
+            gx_a,
+            gy_a,
+            gz_a,
+            color="#ffcc44",
+            arrow_length_ratio=0.3,
+            linewidth=2,
+        )
+        ax.text(
+            cx + gx_a * 1.3,
+            cy + gy_a * 1.3,
+            cz + gz_a * 1.3,
+            "a",
+            color="#ffcc44",
+            fontsize=10,
+            fontfamily="monospace",
+        )
 
         # Set equal aspect ratio and limits
         ax.set_xlim([-10, W + 10])
         ax.set_ylim([-10, H + 10])
         ax.set_zlim([-10, D + 10])
         ax.set_box_aspect([W, H, D])
-        
+
         # Labels
-        ax.set_xlabel('X [mm]', color=C_MUTED, fontsize=8)
-        ax.set_ylabel('Y [mm]', color=C_MUTED, fontsize=8)
-        ax.set_zlabel('Z [mm]', color=C_MUTED, fontsize=8)
-        
+        ax.set_xlabel("X [mm]", color=C_MUTED, fontsize=8)
+        ax.set_ylabel("Y [mm]", color=C_MUTED, fontsize=8)
+        ax.set_zlabel("Z [mm]", color=C_MUTED, fontsize=8)
+
         ax.tick_params(colors=C_MUTED, labelsize=7)
         ax.xaxis.pane.fill = False
         ax.yaxis.pane.fill = False
         ax.zaxis.pane.fill = False
-        ax.xaxis.pane.set_edgecolor('#333')
-        ax.yaxis.pane.set_edgecolor('#333')
-        ax.zaxis.pane.set_edgecolor('#333')
+        ax.xaxis.pane.set_edgecolor("#333")
+        ax.yaxis.pane.set_edgecolor("#333")
+        ax.zaxis.pane.set_edgecolor("#333")
 
         # View angle
         ax.view_init(elev=20, azim=45)
 
         # Mode badge (as 2D text overlay)
-        self.fig.text(0.02, 0.90, "◉ MARBLES",
-                     color=C_GREEN, fontsize=10, fontfamily="monospace",
-                     fontweight="bold")
+        self.fig.text(
+            0.02,
+            0.90,
+            "◉ MARBLES",
+            color=C_GREEN,
+            fontsize=10,
+            fontfamily="monospace",
+            fontweight="bold",
+        )
 
         # Connection indicator
         sym = "●" if self._connected else "○"
         col = C_GREEN if self._connected else C_RED
         label = f"{self._conn_label} Connected" if self._connected else "Scanning…"
-        self.fig.text(0.35, 0.90, f"{sym} {label}",
-                     color=col, fontsize=9, fontfamily="monospace")
+        self.fig.text(
+            0.35, 0.90, f"{sym} {label}", color=col, fontsize=9, fontfamily="monospace"
+        )
 
         # Physics Hz
         hz = self.phys_hz
         if hz > 0:
             phz_col = C_GREEN if hz >= 900 else ("#ffcc44" if hz >= 700 else C_RED)
-            self.fig.text(0.02, 0.13, f"⚡ {hz} / 1000 Hz",
-                         color=phz_col, fontsize=9, fontfamily="monospace")
+            self.fig.text(
+                0.02,
+                0.13,
+                f"⚡ {hz} / 1000 Hz",
+                color=phz_col,
+                fontsize=9,
+                fontfamily="monospace",
+            )
 
         self.info.set_text(
             f"  mode     MARBLES\n"
