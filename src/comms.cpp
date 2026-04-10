@@ -6,6 +6,7 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
+#include <BLE2902.h>
 
 // ── Telemetry snapshot (defined here, extern'd in comms.h) ───────────────────
 volatile float telem_sin_alpha = 0.0f;
@@ -137,6 +138,7 @@ void commsInit()
 
     s_ble_telem = svc->createCharacteristic(
         BLE_TELEM_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    s_ble_telem->addDescriptor(new BLE2902());
 
     BLECharacteristic *cmd = svc->createCharacteristic(
         BLE_CMD_UUID,
@@ -146,6 +148,7 @@ void commsInit()
     s_ble_stat = svc->createCharacteristic(
         BLE_STAT_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+    s_ble_stat->addDescriptor(new BLE2902());
 
     svc->start();
 
@@ -200,7 +203,7 @@ void commsSendStatus()
 
 void commsStreamMarbles()
 {
-    char buf[256];
+    char buf[320];
     int n = snprintf(buf, sizeof(buf), "@%+.3f,%+.3f,%+.3f,%.3f,%.5f,%.5f,%.5f,%.5f",
                      (float)telem_grav_x,
                      (float)telem_grav_y,
@@ -213,18 +216,19 @@ void commsStreamMarbles()
     for (int i = 0; i < MARBLE_COUNT; i++)
     {
         n += snprintf(buf + n, (int)sizeof(buf) - n,
-                      ",%.1f,%.1f,%.1f",
+                      ",%.1f,%.1f,%.1f,%.2f",
                       g_marbles[i].x * 1000.0f,
                       g_marbles[i].y * 1000.0f,
-                      g_marbles[i].z * 1000.0f);
+                      g_marbles[i].z * 1000.0f,
+                      g_marbles[i].r * 1000.0f);
     }
     snprintf(buf + n, (int)sizeof(buf) - n, "\n");
     Serial.print(buf);
 
-    // BLE: send marble data (9 header floats + MARBLE_COUNT × 3 position floats)
+    // BLE: send marble data (9 header floats + MARBLE_COUNT × 4 floats: x,y,z,r)
     if (s_ble_server && s_ble_server->getConnectedCount() > 0 && s_ble_telem)
     {
-        const int float_count = 9 + MARBLE_COUNT * 3;
+        const int float_count = 9 + MARBLE_COUNT * 4;
         float pkt[float_count];
         pkt[0] = telem_grav_x;
         pkt[1] = telem_grav_y;
@@ -237,9 +241,10 @@ void commsStreamMarbles()
         pkt[8] = telem_qz;
         for (int i = 0; i < MARBLE_COUNT; i++)
         {
-            pkt[9 + i * 3 + 0] = g_marbles[i].x * 1000.0f;
-            pkt[9 + i * 3 + 1] = g_marbles[i].y * 1000.0f;
-            pkt[9 + i * 3 + 2] = g_marbles[i].z * 1000.0f;
+            pkt[9 + i * 4 + 0] = g_marbles[i].x * 1000.0f;
+            pkt[9 + i * 4 + 1] = g_marbles[i].y * 1000.0f;
+            pkt[9 + i * 4 + 2] = g_marbles[i].z * 1000.0f;
+            pkt[9 + i * 4 + 3] = g_marbles[i].r * 1000.0f;
         }
         s_ble_telem->setValue((uint8_t *)pkt, sizeof(pkt));
         s_ble_telem->notify();

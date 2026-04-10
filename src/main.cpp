@@ -85,7 +85,7 @@ static void taskPhysics(void * /*param*/)
                                        imu_lin_accel_z, // box acceleration Z [m/s²]
                                        imu_grav_z);     // gravity Z [m/s²]
 
-            // 3. Haptic — scale marble impact speed to tube haptic reference
+            // 3. Haptic — scale marble impact momentum to tube haptic reference
             hapticUpdate(0.0f, 0.0f, false,
                          impact * (HAPTIC_IMPACT_REF / MARBLE_IMPACT_REF));
 

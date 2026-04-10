@@ -8,7 +8,7 @@
 static constexpr float G_FACTOR = 7.0f;       // g/1.4 — solid sphere [m/s²]
 static constexpr float FRICTION_MU = 0.20f;   // Coulomb coefficient (sliding)
 static constexpr int WTABLE_SIZE = 30;        // rolling texture spatial period [mm]
-static constexpr float RESTITUTION_E = 0.35f; // bounce coefficient
+static constexpr float RESTITUTION_E = 0.50f; // bounce coefficient (matches web sim feel)
 
 static constexpr int PHYS_HZ = 1000;            // physics loop rate [Hz]
 static constexpr float PHYS_H = 1.0f / PHYS_HZ; // time step [s]
@@ -21,7 +21,7 @@ static constexpr float HAPTIC_MAX_AMP = 0.80f;   // cap rolling amplitude [0–1
 static constexpr float HAPTIC_MIN_SPD = 0.05f;   // silence below this speed [m/s]
 static constexpr uint32_t IMPACT_MS = 9;         // impact pulse max duration [ms]
 static constexpr uint32_t IMPACT_MIN_MS = 2;     // impact pulse min duration [ms]
-static constexpr float HAPTIC_IMPACT_REF = 3.0f; // speed [m/s] → full impact amplitude
+static constexpr float HAPTIC_IMPACT_REF = 2.0f; // speed [m/s] → full impact amplitude
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Marble box simulation (3D)
@@ -31,9 +31,12 @@ static constexpr int MARBLE_COUNT = 3;
 static constexpr float MARBLE_BOX_W = 0.050f;      // box width  [m] (X)
 static constexpr float MARBLE_BOX_H = 0.025f;      // box height [m] (Y)
 static constexpr float MARBLE_BOX_D = 0.025f;      // box depth  [m] (Z)
-static constexpr float MARBLE_RAD = 0.001f;        // marble radius [m] (2mm diameter)
 static constexpr float MARBLE_RESTITUTION = 0.70f; // bounce coefficient
-static constexpr float MARBLE_IMPACT_REF = 0.50f;  // speed [m/s] → full haptic amplitude
+static constexpr float MARBLE_IMPACT_REF = 0.50f;  // momentum [kg·m/s] → full haptic amplitude
+
+// Per-marble properties: [heavy steel, medium glass, light plastic]
+static constexpr float MARBLE_MASSES[MARBLE_COUNT] = {2.5f, 1.0f, 0.4f};
+static constexpr float MARBLE_RADII[MARBLE_COUNT]  = {0.0015f, 0.0010f, 0.0007f}; // [m]
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telemetry periods

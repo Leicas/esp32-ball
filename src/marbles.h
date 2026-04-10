@@ -4,6 +4,8 @@
 struct Marble
 {
     float x, y, z, vx, vy, vz;
+    float mass; // relative mass [arbitrary units, 1.0 = reference]
+    float r;    // radius [m]
 };
 
 // All marble positions and velocities (written by physics task)

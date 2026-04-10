@@ -113,7 +113,10 @@ _MARBLE_COUNT = 3
 _BOX_W_MM = 50.0
 _BOX_H_MM = 25.0
 _BOX_D_MM = 25.0
-_MARBLE_RAD_MM = 1.0  # 2mm diameter
+_MARBLE_RAD_MM = 1.0  # default fallback for old firmware
+# Per-marble defaults matching firmware config.h [heavy steel, medium glass, light plastic]
+_MARBLE_RADII_MM = [1.5, 1.0, 0.7]
+_MARBLE_COLORS = ["#c0c0c0", "#44aaff", "#ff6644"]  # silver, blue, orange
 
 
 def _normalize_quat(qw, qx, qy, qz):
@@ -178,6 +181,7 @@ class Visualizer:
         self.marbles: list = [
             (_BOX_W_MM / 2, _BOX_H_MM / 2, _BOX_D_MM / 2)
         ] * _MARBLE_COUNT
+        self.marble_radii: list = list(_MARBLE_RADII_MM)
         self.grav_x: float = 0.0
         self.grav_y: float = 0.0
         self.grav_z: float = 0.0
@@ -237,12 +241,14 @@ class Visualizer:
         if cavity_mm is not None:
             self.cavity_mm = cavity_mm
 
-    def _on_telem_marble(self, grav_x, grav_y, grav_z, impact_e, positions, quat=None):
+    def _on_telem_marble(self, grav_x, grav_y, grav_z, impact_e, positions, quat=None, radii=None):
         self.grav_x = grav_x
         self.grav_y = grav_y
         self.grav_z = grav_z
         self.impact_energy = impact_e
         self.marbles = positions
+        if radii is not None:
+            self.marble_radii = radii
         if quat is not None:
             self.qw, self.qx, self.qy, self.qz = _normalize_quat(*quat)
         else:
@@ -269,27 +275,37 @@ class Visualizer:
                     pass
         elif line.startswith("@"):
             parts = line[1:].split(",")
-            expected_new = 8 + _MARBLE_COUNT * 3
-            expected_old = 4 + _MARBLE_COUNT * 3
-            if len(parts) in (expected_new, expected_old):
+            # New format: 8 header + MARBLE_COUNT * 4 (x,y,z,r per marble)
+            expected_v3 = 8 + _MARBLE_COUNT * 4
+            # Legacy formats: 8 header + 3 per marble, or 4 header + 3 per marble
+            expected_v2 = 8 + _MARBLE_COUNT * 3
+            expected_v1 = 4 + _MARBLE_COUNT * 3
+            if len(parts) in (expected_v3, expected_v2, expected_v1):
                 try:
                     vals = list(map(float, parts))
-                    if len(parts) == expected_new:
+                    if len(parts) == expected_v3:
                         quat = (vals[4], vals[5], vals[6], vals[7])
-                        pos_offset = 8
+                        positions = [
+                            (vals[8 + i * 4], vals[8 + i * 4 + 1], vals[8 + i * 4 + 2])
+                            for i in range(_MARBLE_COUNT)
+                        ]
+                        radii = [vals[8 + i * 4 + 3] for i in range(_MARBLE_COUNT)]
+                    elif len(parts) == expected_v2:
+                        quat = (vals[4], vals[5], vals[6], vals[7])
+                        positions = [
+                            (vals[8 + i * 3], vals[8 + i * 3 + 1], vals[8 + i * 3 + 2])
+                            for i in range(_MARBLE_COUNT)
+                        ]
+                        radii = None
                     else:
                         quat = None
-                        pos_offset = 4
-                    positions = [
-                        (
-                            vals[pos_offset + i * 3],
-                            vals[pos_offset + i * 3 + 1],
-                            vals[pos_offset + i * 3 + 2],
-                        )
-                        for i in range(_MARBLE_COUNT)
-                    ]
+                        positions = [
+                            (vals[4 + i * 3], vals[4 + i * 3 + 1], vals[4 + i * 3 + 2])
+                            for i in range(_MARBLE_COUNT)
+                        ]
+                        radii = None
                     self._on_telem_marble(
-                        vals[0], vals[1], vals[2], vals[3], positions, quat
+                        vals[0], vals[1], vals[2], vals[3], positions, quat, radii
                     )
                 except ValueError:
                     pass
@@ -421,7 +437,18 @@ class Visualizer:
             # Legacy tube mode: 3 floats (sin_alpha, x_mm, v_mps)
             elif len(data) == 12:
                 self._on_telem(*struct.unpack_from("<fff", data))
-            # Marble mode: 9 header floats + MARBLE_COUNT * 3 position floats
+            # New marble mode: 9 header floats + MARBLE_COUNT * 4 (x,y,z,r per marble)
+            elif len(data) == 4 * (9 + _MARBLE_COUNT * 4):
+                vals = struct.unpack_from(f"<{9 + _MARBLE_COUNT * 4}f", data)
+                positions = [
+                    (vals[9 + i * 4], vals[9 + i * 4 + 1], vals[9 + i * 4 + 2])
+                    for i in range(_MARBLE_COUNT)
+                ]
+                radii = [vals[9 + i * 4 + 3] for i in range(_MARBLE_COUNT)]
+                quat = (vals[5], vals[6], vals[7], vals[8])
+                self._on_telem_marble(vals[0], vals[1], vals[2], vals[3], positions, quat, radii)
+                self.phys_hz = int(vals[4])
+            # Legacy marble mode: 9 header + MARBLE_COUNT * 3 position floats
             elif len(data) == 4 * (9 + _MARBLE_COUNT * 3):
                 vals = struct.unpack_from(f"<{9 + _MARBLE_COUNT * 3}f", data)
                 positions = [
@@ -893,7 +920,7 @@ class Visualizer:
         ax.set_facecolor(PANEL_BG)
         ax.grid(False)
 
-        W, H, D, R = _BOX_W_MM, _BOX_H_MM, _BOX_D_MM, _MARBLE_RAD_MM
+        W, H, D = _BOX_W_MM, _BOX_H_MM, _BOX_D_MM
         qw, qx, qy, qz = self.qw, self.qx, self.qy, self.qz
         center = np.array([W / 2, H / 2, D / 2], dtype=np.float32)
 
@@ -938,21 +965,23 @@ class Visualizer:
             )
             ax.add_collection3d(flash_overlay)
 
-        # Draw marbles as spheres
+        # Draw marbles as spheres (per-marble radius and color)
         u = np.linspace(0, 2 * np.pi, 15)
         v = np.linspace(0, np.pi, 10)
-        sphere_x = R * np.outer(np.cos(u), np.sin(v))
-        sphere_y = R * np.outer(np.sin(u), np.sin(v))
-        sphere_z = R * np.outer(np.ones(np.size(u)), np.cos(v))
+        unit_x = np.outer(np.cos(u), np.sin(v))
+        unit_y = np.outer(np.sin(u), np.sin(v))
+        unit_z = np.outer(np.ones(np.size(u)), np.cos(v))
 
-        for mx, my, mz in self.marbles:
+        for idx, (mx, my, mz) in enumerate(self.marbles):
+            mr = self.marble_radii[idx] if idx < len(self.marble_radii) else _MARBLE_RAD_MM
+            mc = _MARBLE_COLORS[idx] if idx < len(_MARBLE_COLORS) else C_BLUE
             m = np.array([mx, my, mz], dtype=np.float32)
             m = _quat_rotate(m - center, qw, qx, qy, qz) + center
             ax.plot_surface(
-                sphere_x + m[0],
-                sphere_y + m[1],
-                sphere_z + m[2],
-                color=C_BLUE,
+                unit_x * mr + m[0],
+                unit_y * mr + m[1],
+                unit_z * mr + m[2],
+                color=mc,
                 alpha=0.92,
                 edgecolor="#ffffff88",
                 linewidth=0.3,
@@ -1046,9 +1075,15 @@ class Visualizer:
                 fontfamily="monospace",
             )
 
+        marble_info = "  marbles  "
+        labels = ["heavy", "medium", "light"]
+        for idx in range(_MARBLE_COUNT):
+            r = self.marble_radii[idx] if idx < len(self.marble_radii) else _MARBLE_RAD_MM
+            lbl = labels[idx] if idx < len(labels) else f"#{idx}"
+            marble_info += f"{lbl}({r:.1f}mm) " if idx < _MARBLE_COUNT - 1 else f"{lbl}({r:.1f}mm)"
         self.info.set_text(
             f"  mode     MARBLES\n"
-            f"  marbles  {_MARBLE_COUNT}\n"
+            f"{marble_info}\n"
             f"  box      {_BOX_W_MM:.0f} x {_BOX_H_MM:.0f} x {_BOX_D_MM:.0f} mm\n"
             f"  accel_x  {self.grav_x:+.3f} g\n"
             f"  accel_y  {self.grav_y:+.3f} g\n"
