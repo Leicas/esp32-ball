@@ -58,6 +58,17 @@ pio run -e codecell_drive --target upload && pio device monitor
 
 There are no automated tests — this is embedded firmware verified by deploying to hardware and reading serial output.
 
+### `a7_bringup` — custom A7 PCB self-test
+
+`src/a7_bringup/main.cpp` is a standalone bring-up firmware for the custom Rolling Stone A7 board (repo `esp32-ball-hardware`). It is excluded from the other envs via `build_src_filter`. The board enumerates as an Espressif USB-Serial/JTAG port (VID:PID 303A:1001), so pass the port explicitly:
+
+```bash
+pio run -e a7_bringup --target upload --upload-port COM50
+pio device monitor -p COM50
+```
+
+Pin map (from `esp32-ball-hardware/firmware-interface.md`, verified against `kicad/circuit.json` and on hardware 2026-10-07): PCA9632 handle RGB on I2C IO6/IO7 @0x62; LSM6DS3TR-C on SPI SCK=IO14 MOSI=IO15 MISO=IO18 CS=IO19 INT1=IO2 (WHO_AM_I reads **0x6A**); VSYS ADC IO4 (÷2); USB_GOOD_N IO3; buttons MODE=IO0 GAIN=IO1 BOOT=IO9; HAPTIC_EN IO5; TDM BCLK=IO21 FS=IO22 DATA=IO23 to four MAX98357A (48 kHz, 8×16-bit slots, slot 0..3 = LFi/MF/HF/LF); blade pixels IO20. Serial commands: `?` help, `s` self-test, `m` IMU probe, `r g b w 0 c` LED, `a` accel stream, `1`–`4` tone per channel (auto-off 3 s, amplitude capped at 0.25 FS), `x` stop, `+`/`-` amplitude, `f` frequency, `p`/`k` blade rainbow/black.
+
 ## Toolchain Notes
 
 The `fix_toolchain_path.py` pre-script runs automatically before every build and handles two known issues with the espressif32 platform on Windows:
