@@ -11,18 +11,22 @@
  *   - USB_GOOD_N charger input       (IO3)
  *   - MODE / GAIN / BOOT buttons     (IO0 / IO1 / IO9, active low)
  *   - MAX98357A x4 TDM haptic amps   (BCLK=IO21 FS=IO22 DATA=IO23, SD=IO5)  — on command only
+ *   - Fitted actuators (LFi, HF)     ('t': frequency sweep per channel, vibration
+ *                                     measured by the on-board IMU at 1.66 kHz)
  *   - Addressable blade data         (IO20 via 5 V buffer)                   — on command only
  *
  * Pin map source: esp32-ball-hardware/firmware-interface.md, cross-checked
  * against kicad/circuit.json (U5 module pins → nets).
  *
  * Safety policy from firmware-interface.md:
- *   - USB_500 (IO17) held LOW  → USB100 charging only
+ *   - USB_500 (IO17) HIGH by default → USB500 input limit (USB100 browns out at
+ *     0.25 FS haptics without a battery); 'u' toggles back to USB100
  *   - HAPTIC_EN (IO5) LOW at boot; only raised after TDM clocks run with zeros
  *   - haptic amplitude capped at AMP_MAX full-scale; auto-off after HAPTIC_MAX_ON_MS
  */
 
 #include <Arduino.h>
+#include "../threeway_filter.h"
 #include <Wire.h>
 #include <SPI.h>
 #include <Adafruit_NeoPixel.h>
@@ -69,12 +73,38 @@ static constexpr uint32_t TDM_RATE = 48000;
 static constexpr int TDM_SLOTS = 8;
 static constexpr int TDM_BLOCK_FRAMES = 256;
 static constexpr float AMP_DEFAULT = 0.10f; // fraction of full scale (~0.4 Vrms @ 12 dB)
-static constexpr float AMP_MAX = 0.25f;     // hard cap (~1 Vrms) — raise only after bench measurement
+static constexpr float AMP_MAX = 1.0f;     // full-scale test limit (8-ohm Drake, 3.3 V rail) — raise only after bench measurement
 static constexpr float AMP_STEP = 0.05f;
 static constexpr float RAMP_PER_SAMPLE = 1.0f / (0.020f * TDM_RATE); // 20 ms ramp
 static constexpr uint32_t HAPTIC_MAX_ON_MS = 3000;
 static const float CH_DEFAULT_HZ[4] = {80.0f, 150.0f, 250.0f, 60.0f}; // LFi, MF, HF, LF
 static const char *CH_NAME[4] = {"LFi(J3,U7)", "MF(J4,U8)", "HF(J5,U10)", "LF(J6,U11)"};
+static const bool CH_FITTED[4] = {true, true, true, true}; // fitted: LFi, MF, HF, LF
+
+// Actuator test ('t'): sweep each fitted channel, compare IMU vibration RMS to a silent baseline
+static const float ACT_TEST_HZ[] = {50.0f, 80.0f, 125.0f, 175.0f, 250.0f, 320.0f};
+static constexpr int ACT_TEST_NF = sizeof(ACT_TEST_HZ) / sizeof(ACT_TEST_HZ[0]);
+static constexpr uint32_t ACT_MEAS_MS = 250;
+static constexpr float ACT_PASS_RATIO = 3.0f;  // tone RMS / baseline RMS
+static constexpr float ACT_PASS_MIN_MG = 2.0f; // and an absolute floor
+
+// Full sweep ('W'): log-spaced lock-in measurement, streamed as $sw CSV for companion/actuator_sweep.py
+static constexpr float SWEEP_F0 = 20.0f, SWEEP_F1 = 500.0f;
+static constexpr int SWEEP_NF = 40;
+static constexpr float SWEEP_MEAS_S = 0.20f; // rounded up to whole cycles
+static constexpr float IMU_NYQ_HZ = 800.0f;  // 1.66 kHz ODR
+static constexpr uint8_t SWEEP_CTRL1_XL = 0x84;  // 1.66 kHz, ±16 g for full-drive measurements
+static constexpr double SWEEP_MG_PER_LSB = 0.488;
+static volatile bool g_signature_sweep=false;
+static uint32_t g_signature_t[1024];
+static int16_t g_signature_xyz[1024][3];
+static int g_signature_n=0;
+
+// Continuous chirp stream ('C'): exponential chirp per mode, raw accel streamed from the IMU FIFO
+// for companion/chirp_view.py. Frequency is updated once per TDM block (5.3 ms).
+static constexpr float CHIRP_F0 = 20.0f, CHIRP_F1 = 500.0f, CHIRP_S = 6.0f;
+static constexpr uint32_t CHIRP_GAP_MS = 400;
+static constexpr uint32_t CHIRP_NBLK = (uint32_t)(CHIRP_S * TDM_RATE / TDM_BLOCK_FRAMES);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -95,10 +125,24 @@ static volatile esp_err_t g_aud_err = ESP_OK;
 static volatile uint32_t g_loop_iters = 0;
 static volatile bool g_tdm_running = false;
 static volatile float g_amp_target[4] = {0, 0, 0, 0};
+static volatile bool g_ch_invert[4] = {false, false, false, false};
+static portMUX_TYPE g_amp_mux = portMUX_INITIALIZER_UNLOCKED; // targets change atomically across channels
+static bool g_usb500 = true;
+static volatile bool g_slot_mirror = false;
+static volatile bool g_chirp_on = false;    // audio task sweeps g_freq[] while set
+static volatile uint32_t g_chirp_blk = 0;   // blocks since chirp start (audio task increments)
 static float g_freq[4] = {CH_DEFAULT_HZ[0], CH_DEFAULT_HZ[1], CH_DEFAULT_HZ[2], CH_DEFAULT_HZ[3]};
 static float g_amp_level = AMP_DEFAULT;
 static uint32_t g_haptic_on_since = 0;
 static int16_t g_tdm_buf[TDM_BLOCK_FRAMES * TDM_SLOTS];
+
+struct ActResult
+{
+    bool run;
+    bool pass;
+    float base_mg, best_mg, best_hz;
+};
+static ActResult g_act[4] = {};
 
 static void IRAM_ATTR imuIsr() { g_imu_irq_count++; }
 
@@ -240,6 +284,40 @@ static void imuSample(float acc_g[3], float gyr_dps[3])
     }
 }
 
+// Vibration RMS (mg, summed over axes, DC removed) with the accel at 1.66 kHz.
+// Caller must have set CTRL1_XL to 1.66 kHz first.
+static float imuVibRms(uint32_t ms, int *n_out = nullptr, double mg_per_lsb = 0.061)
+{
+    int64_t sum[3] = {0, 0, 0}, sq[3] = {0, 0, 0};
+    int n = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < ms)
+    {
+        if (!(imuRead8(0x1E) & 0x01)) // STATUS_REG.XLDA
+            continue;
+        uint8_t raw[6];
+        imuReadBurst(0x28, raw, 6); // OUTX_L_XL .. OUTZ_H_XL
+        for (int i = 0; i < 3; i++)
+        {
+            int32_t v = (int16_t)(raw[2 * i] | (raw[2 * i + 1] << 8));
+            sum[i] += v;
+            sq[i] += (int64_t)v * v;
+        }
+        n++;
+    }
+    if (n_out)
+        *n_out = n;
+    if (n < 2)
+        return -1.0f;
+    double var = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        double m = (double)sum[i] / n;
+        var += (double)sq[i] / n - m * m;
+    }
+    return (float)(sqrt(var > 0 ? var : 0) * mg_per_lsb); // default 0.061 mg/LSB @ ±2 g
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Power / inputs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +405,519 @@ static void hapticPlay(int ch)
                   ch + 1, CH_NAME[ch], g_freq[ch], g_amp_level, HAPTIC_MAX_ON_MS);
 }
 
+// Sweep each fitted actuator and check the IMU feels it. Blocks ~5 s.
+static void actuatorTest(bool all_channels = false)
+{
+    if (!g_tdm_ok)
+    {
+        Serial.println("# act: TDM not initialised — skipped");
+        return;
+    }
+    Serial.printf("# --- actuator test (amp=%.2f FS, IMU %s) ---------------------\n",
+                  g_amp_level, g_imu_ok ? "1.66 kHz" : "UNAVAILABLE — feel check only");
+    if (g_imu_ok)
+    {
+        imuWrite8(0x10, 0x80); // CTRL1_XL: 1.66 kHz, ±2 g
+        delay(20);
+    }
+    for (int i = 0; i < 4; i++)
+        g_amp_target[i] = 0;
+    hapticStart(); // amps on, silent → baseline includes idle amp/clock coupling
+    delay(50);
+
+    for (int ch = 0; ch < 4; ch++)
+    {
+        if (!CH_FITTED[ch] && !all_channels)
+            continue;
+        ActResult &r = g_act[ch];
+        r = {};
+        r.run = true;
+        float saved_hz = g_freq[ch];
+        int n = 0;
+        delay(300); // let the previous channel ring out so it doesn't inflate this baseline
+        r.base_mg = g_imu_ok ? imuVibRms(ACT_MEAS_MS, &n) : 0;
+        Serial.printf("# act: ch%d %-11s baseline %.2f mg (%d samples)\n", ch + 1, CH_NAME[ch], r.base_mg, n);
+        for (int k = 0; k < ACT_TEST_NF; k++)
+        {
+            g_freq[ch] = ACT_TEST_HZ[k];
+            g_amp_target[ch] = g_amp_level;
+            delay(80); // 20 ms ramp + mechanical settle
+            float mg = g_imu_ok ? imuVibRms(ACT_MEAS_MS) : 0;
+            if (!g_imu_ok)
+                delay(ACT_MEAS_MS);
+            g_amp_target[ch] = 0;
+            float ratio = r.base_mg > 0 ? mg / r.base_mg : 0;
+            Serial.printf("# act:   %3.0f Hz  %6.2f mg  x%.1f\n", ACT_TEST_HZ[k], mg, ratio);
+            if (mg > r.best_mg)
+            {
+                r.best_mg = mg;
+                r.best_hz = ACT_TEST_HZ[k];
+            }
+            delay(60); // ramp down + ring-out before next step
+        }
+        g_freq[ch] = saved_hz;
+        r.pass = g_imu_ok && r.best_mg >= ACT_PASS_MIN_MG && r.best_mg >= ACT_PASS_RATIO * r.base_mg;
+        Serial.printf("# act: ch%d %-11s %s  peak %.2f mg @ %.0f Hz\n", ch + 1, CH_NAME[ch],
+                      g_imu_ok ? (r.pass ? "PASS" : "FAIL") : "NOT MEASURED", r.best_mg, r.best_hz);
+    }
+
+    hapticStop();
+    if (g_imu_ok)
+        imuWrite8(0x10, 0x40); // CTRL1_XL back to 104 Hz, ±2 g
+    Serial.println("# ----------------------------------------------------------");
+}
+
+static void usb500Set(bool on)
+{
+    g_usb500 = on;
+    digitalWrite(PIN_USB_500, on ? HIGH : LOW);
+    Serial.printf("# usb input limit: %s\n", on ? "USB500 (IO17=1)" : "USB100 (IO17=0)");
+}
+
+// Set several channel targets in one step so the audio task starts them on the same sample
+// (phase accumulators restart at 0 from silence → channels driven together are phase-locked).
+static void ampTargets(float a0, float a1, float a2, float a3)
+{
+    portENTER_CRITICAL(&g_amp_mux);
+    g_amp_target[0] = a0; g_amp_target[1] = a1; g_amp_target[2] = a2; g_amp_target[3] = a3;
+    portEXIT_CRITICAL(&g_amp_mux);
+}
+
+// Lock-in measurement at f, 2f, 3f on all three accel axes (accel must be at SWEEP_CTRL1_XL).
+// DFT uses each sample's own timestamp, so ODR tolerance and polling jitter don't bias the bin.
+struct ToneResp
+{
+    float h_mg[3]; // peak amplitude of the vector response at f, 2f, 3f (-1 = above Nyquist)
+    float rms_mg;  // broadband AC RMS
+    int n;
+};
+static ToneResp imuToneResp(float f, float min_s)
+{
+    g_signature_n=0;
+    float c[3][3] = {}, s[3][3] = {}, sc[3] = {}, ss[3] = {}; // [harmonic][axis]
+    int64_t sum[3] = {0, 0, 0}, sq[3] = {0, 0, 0};
+    int n = 0;
+    const int64_t dur_us = (int64_t)(ceilf(min_s * f) / f * 1e6f);
+    const int64_t t0 = esp_timer_get_time();
+    for (;;)
+    {
+        if (!(imuRead8(0x1E) & 0x01))
+            continue;
+        int64_t t = esp_timer_get_time() - t0;
+        if (t >= dur_us)
+            break;
+        uint8_t raw[6];
+        imuReadBurst(0x28, raw, 6);
+        if(g_signature_sweep && g_signature_n<1024) {
+            g_signature_t[g_signature_n]=(uint32_t)t;
+            for(int axis=0;axis<3;++axis)
+                g_signature_xyz[g_signature_n][axis]=(int16_t)(raw[2*axis]|(raw[2*axis+1]<<8));
+            ++g_signature_n;
+        }
+        double cyc = (double)f * (double)t * 1e-6;
+        float ph = (float)(2.0 * M_PI * (cyc - floor(cyc)));
+        float c1 = cosf(ph), s1 = sinf(ph);
+        float ch[3] = {c1, c1 * c1 - s1 * s1, 0}, sh[3] = {s1, 2 * s1 * c1, 0};
+        ch[2] = ch[1] * c1 - sh[1] * s1;
+        sh[2] = sh[1] * c1 + ch[1] * s1;
+        for (int h = 0; h < 3; h++)
+        {
+            sc[h] += ch[h];
+            ss[h] += sh[h];
+        }
+        for (int i = 0; i < 3; i++)
+        {
+            int32_t v = (int16_t)(raw[2 * i] | (raw[2 * i + 1] << 8));
+            sum[i] += v;
+            sq[i] += (int64_t)v * v;
+            for (int h = 0; h < 3; h++)
+            {
+                c[h][i] += v * ch[h];
+                s[h][i] += v * sh[h];
+            }
+        }
+        n++;
+    }
+    ToneResp r = {};
+    r.n = n;
+    if (n < 8)
+    {
+        r.h_mg[0] = r.h_mg[1] = r.h_mg[2] = r.rms_mg = -1;
+        return r;
+    }
+    double var = 0;
+    for (int h = 0; h < 3; h++)
+    {
+        if ((h + 1) * f > IMU_NYQ_HZ * 0.9f)
+        {
+            r.h_mg[h] = -1;
+            continue;
+        }
+        double p = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            double m = (double)sum[i] / n; // remove DC leakage into the bin
+            double cr = c[h][i] - m * sc[h], si = s[h][i] - m * ss[h];
+            p += cr * cr + si * si;
+        }
+        r.h_mg[h] = (float)(2.0 * sqrt(p) / n * SWEEP_MG_PER_LSB);
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        double m = (double)sum[i] / n;
+        var += (double)sq[i] / n - m * m;
+    }
+    r.rms_mg = (float)(sqrt(var > 0 ? var : 0) * SWEEP_MG_PER_LSB);
+    return r;
+}
+
+// Host-driven characterization: Q mask hz amp seconds invertMask.
+// Binary records are timestamp-us + XYZ int16 (10 bytes), sent only after silence.
+static uint32_t g_char_t[14000];
+static int16_t g_char_xyz[14000][3];
+static volatile bool g_characterize=false;
+static volatile int g_char_shape=0;
+static void characterize(int mask,float hz,float amp,float seconds,int invertMask) {
+ if(!g_tdm_ok||!g_imu_ok||mask<0||mask>15||hz<0||hz>20000||seconds<.08f||seconds>4.f){Serial.println("$err,parameters");return;}
+ amp=fminf(1.f,fmaxf(0.f,amp));
+ ampTargets(0,0,0,0);hapticStart();delay(40);
+ imuWrite8(0x10,0x94); // 3.33kHz +/-16g, analog BW1.5kHz
+ imuWrite8(0x15,0x00);imuWrite8(0x17,0x00); // high performance, default LPF1
+ g_char_shape=invertMask&48;g_characterize=true;
+ for(int ch=0;ch<4;++ch){g_freq[ch]=hz;g_ch_invert[ch]=(invertMask&(1<<ch))!=0;}
+ float a[4];for(int ch=0;ch<4;++ch)a[ch]=(mask&(1<<ch))?amp:0;
+ ampTargets(a[0],a[1],a[2],a[3]);
+ delay((uint32_t)(1000*fminf(.5f,fmaxf(.08f,hz>0?2.f/hz:0))));
+ Serial.printf("$begin,%d,%.3f,%.3f,%.3f,%d\n",mask,hz,amp,seconds,invertMask);Serial.flush();
+ int n=0;int64_t t0=esp_timer_get_time();
+ while(esp_timer_get_time()-t0<(int64_t)(seconds*1e6f)) {
+  if(!(imuRead8(0x1E)&1))continue;
+  uint8_t raw[6];imuReadBurst(0x28,raw,6);
+  if(n<14000){g_char_t[n]=(uint32_t)(esp_timer_get_time()-t0);for(int k=0;k<3;++k)g_char_xyz[n][k]=(int16_t)(raw[k*2]|(raw[k*2+1]<<8));++n;}
+ }
+ ampTargets(0,0,0,0);delay(35);
+ Serial.printf("$data,%d,%.3f\n",n,readVsys());
+ for(int i=0;i<n;++i){Serial.write((uint8_t*)&g_char_t[i],4);Serial.write((uint8_t*)g_char_xyz[i],6);}
+ Serial.println("$end");
+ g_characterize=false;hapticStop();imuWrite8(0x10,0x40);
+ for(int ch=0;ch<4;++ch)g_ch_invert[ch]=false;
+}
+
+// Full response sweep of the fitted channels: each solo, then the first two fitted together
+// in phase and in anti-phase. Streams "$sw,mode,hz,amp_fs,h1_mg,h2_mg,h3_mg,rms_mg,vsys,n".
+static volatile bool g_filter_test = false;
+static volatile bool g_filter_reset = false;
+static volatile float g_filter_hz = 50.0f;
+
+static void filteredSweep()
+{
+    if (!g_tdm_ok || !g_imu_ok) { Serial.println("# filtered sweep skipped"); return; }
+    ampTargets(0,0,0,0);
+    imuWrite8(0x10, SWEEP_CTRL1_XL);
+    delay(20);
+    hapticStart();
+    Serial.println("# sweep begin filtered FIR 2kHz, input=1.0, slots=0/2/3");
+    for(int k=0;k<SWEEP_NF;++k) {
+        float f=SWEEP_F0*powf(SWEEP_F1/SWEEP_F0,(float)k/(SWEEP_NF-1));
+        g_filter_hz=f; g_filter_reset=true; g_filter_test=true;
+        delay(160);
+        ToneResp r=imuToneResp(f,SWEEP_MEAS_S);
+        float vs=readVsys();
+        g_filter_test=false;
+        Serial.printf("$sw,E,%.2f,1.00,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",f,r.h_mg[0],r.h_mg[1],r.h_mg[2],r.rms_mg,vs,r.n);
+        delay(160);
+        g_haptic_on_since=millis();
+        if(Serial.available() && Serial.peek()=='x') { Serial.read(); break; }
+    }
+    g_filter_test=false; hapticStop(); imuWrite8(0x10,0x40);
+    Serial.println("# sweep end");
+}
+
+static void sweepRun()
+{
+    if (!g_tdm_ok || !g_imu_ok)
+    {
+        Serial.println("# sweep: needs TDM and IMU — skipped");
+        return;
+    }
+    int fit[4], nfit = 0;
+    for (int ch = 0; ch < 4; ch++)
+        if (CH_FITTED[ch])
+            fit[nfit++] = ch;
+    Serial.printf("# sweep begin amp=%.2f usb500=%d f0=%.0f f1=%.0f nf=%d\n", g_amp_level, (int)g_usb500,
+                  SWEEP_F0, SWEEP_F1, SWEEP_NF);
+    imuWrite8(0x10, SWEEP_CTRL1_XL);
+    delay(20);
+    ampTargets(0, 0, 0, 0);
+    hapticStart();
+    delay(100);
+
+    const int nmodes = g_signature_sweep?nfit:nfit + nfit * (nfit - 1);
+    for (int m = 0; m < nmodes; m++)
+    {
+        float a[4] = {0, 0, 0, 0};
+        char label[8];
+        for (int i = 0; i < 4; i++)
+            g_ch_invert[i] = false;
+        if (m < nfit)
+        {
+            a[fit[m]] = g_amp_level;
+            snprintf(label, sizeof(label), "%d", fit[m] + 1);
+        }
+        else
+        {
+            bool anti = ((m - nfit) % 2) != 0;
+            int pair = (m - nfit) / 2, pi = 0, pj = 1;
+            for (int i = 0, k = 0; i < nfit; ++i)
+                for (int j = i + 1; j < nfit; ++j, ++k)
+                    if (k == pair) { pi = i; pj = j; }
+            a[fit[pi]] = a[fit[pj]] = g_amp_level;
+            g_ch_invert[fit[pj]] = anti;
+            snprintf(label, sizeof(label), "%d%c%d", fit[pi] + 1, anti ? '-' : '+', fit[pj] + 1);
+        }
+        delay(300); // ring-out from the previous mode
+        ToneResp b = imuToneResp(100.0f, SWEEP_MEAS_S);
+        Serial.printf("$sw,%s,0,0,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n", label, b.h_mg[0], b.h_mg[1], b.h_mg[2],
+                      b.rms_mg, readVsys(), b.n); // hz=0 row = silent baseline
+        if(g_signature_sweep) for(int j=0;j<g_signature_n;++j)
+            Serial.printf("$raw,%s,0,%lu,%d,%d,%d\n",label,(unsigned long)g_signature_t[j],g_signature_xyz[j][0],g_signature_xyz[j][1],g_signature_xyz[j][2]);
+        for (int k = 0; k < SWEEP_NF; k++)
+        {
+            float f = SWEEP_F0 * powf(SWEEP_F1 / SWEEP_F0, (float)k / (SWEEP_NF - 1));
+            for (int i = 0; i < 4; i++)
+                g_freq[i] = f;
+            ampTargets(a[0], a[1], a[2], a[3]);
+            delay(70); // 20 ms ramp + settle
+            ToneResp r = imuToneResp(f, SWEEP_MEAS_S);
+            float vs = readVsys();
+            ampTargets(0, 0, 0, 0);
+            Serial.printf("$sw,%s,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n", label, f, g_amp_level, r.h_mg[0],
+                          r.h_mg[1], r.h_mg[2], r.rms_mg, vs, r.n);
+            delay(40); // ramp down (phase accumulators reset at zero amplitude)
+            if(g_signature_sweep) for(int j=0;j<g_signature_n;++j)
+                Serial.printf("$raw,%s,%.2f,%lu,%d,%d,%d\n",label,f,(unsigned long)g_signature_t[j],g_signature_xyz[j][0],g_signature_xyz[j][1],g_signature_xyz[j][2]);
+            g_haptic_on_since = millis();
+        }
+    }
+    for (int i = 0; i < 4; i++)
+    {
+        g_ch_invert[i] = false;
+        g_freq[i] = CH_DEFAULT_HZ[i];
+    }
+    hapticStop();
+    imuWrite8(0x10, 0x40); // CTRL1_XL back to 104 Hz, ±2 g
+    Serial.println("# sweep end");
+}
+
+// ── Continuous chirp stream ──────────────────────────────────────────────────
+// Output (all on serial):
+//   $ci,odr_hz,mg_per_lsb,f0,f1,chirp_ms   stream parameters, once
+//   %x,y,z                                 raw accel sample (LSB), every FIFO sample
+//   $cs,mode,sample_idx  /  $ce,mode,sample_idx   chirp start / end at that sample index
+//   $ts,sample_count,esp_timer_us          every 500 ms, for ODR estimation
+static bool g_cs_on = false, g_cs_in_chirp = false;
+static int g_cs_mode = 0;
+static uint32_t g_cs_t = 0, g_cs_ts = 0, g_xl_count = 0;
+
+static int imuFifoUnreadWords()
+{
+    uint8_t st[2];
+    imuReadBurst(0x3A, st, 2); // FIFO_STATUS1/2
+    return st[0] | ((st[1] & 0x07) << 8);
+}
+static int16_t imuFifoWord()
+{
+    uint8_t w[2];
+    imuReadBurst(0x3E, w, 2); // FIFO_DATA_OUT_L/H
+    return (int16_t)(w[0] | (w[1] << 8));
+}
+static void imuFifoDrain()
+{
+    static char buf[1024];
+    int len = 0;
+    int words = imuFifoUnreadWords();
+    // realign to an X word if a partial sample was left behind
+    uint8_t pat[2];
+    imuReadBurst(0x3C, pat, 2); // FIFO_STATUS3/4: next word's position in the pattern
+    int p = pat[0] | ((pat[1] & 0x03) << 8);
+    while (p != 0 && words > 0)
+    {
+        imuFifoWord();
+        words--;
+        p = (p + 1) % 3;
+    }
+    for (int s = 0; s < words / 3 && s < 96; s++)
+    {
+        int16_t x = imuFifoWord(), y = imuFifoWord(), z = imuFifoWord();
+        len += snprintf(buf + len, sizeof(buf) - len, "%%%d,%d,%d\n", x, y, z);
+        g_xl_count++;
+        if (len > (int)sizeof(buf) - 32)
+        {
+            Serial.write((const uint8_t *)buf, len);
+            len = 0;
+        }
+    }
+    if (len)
+        Serial.write((const uint8_t *)buf, len);
+}
+
+static int chirpModes(int fit[4], int &nfit)
+{
+    nfit = 0;
+    for (int ch = 0; ch < 4; ch++)
+        if (CH_FITTED[ch])
+            fit[nfit++] = ch;
+    return nfit + (nfit >= 2 ? 1 : 0); // each solo, then the first two together in phase
+}
+
+static void chirpStreamStop()
+{
+    if (!g_cs_on)
+        return;
+    g_cs_on = false;
+    g_chirp_on = false;
+    hapticStop();
+    imuWrite8(0x0A, 0x00); // FIFO bypass
+    imuWrite8(0x10, 0x40); // CTRL1_XL back to 104 Hz, ±2 g
+    for (int i = 0; i < 4; i++)
+        g_freq[i] = CH_DEFAULT_HZ[i];
+    Serial.println("# chirp stream off");
+}
+
+static void chirpStreamStart()
+{
+    if (!g_tdm_ok || !g_imu_ok)
+    {
+        Serial.println("# chirp: needs TDM and IMU — skipped");
+        return;
+    }
+    imuWrite8(0x10, SWEEP_CTRL1_XL);
+    imuWrite8(0x0A, 0x00); // FIFO bypass (clears it)
+    imuWrite8(0x08, 0x01); // FIFO_CTRL3: accel in FIFO, no decimation; gyro out
+    imuWrite8(0x09, 0x00);
+    imuWrite8(0x0A, 0x46); // FIFO_CTRL5: FIFO ODR 1.66 kHz, continuous mode
+    ampTargets(0, 0, 0, 0);
+    hapticStart();
+    g_cs_on = true;
+    g_cs_in_chirp = false;
+    g_cs_mode = 0;
+    g_cs_t = g_cs_ts = millis();
+    g_xl_count = 0;
+    Serial.printf("# chirp stream on (amp=%.2f FS) — 'C' or 'x' to stop\n", g_amp_level);
+    Serial.printf("$ci,1666,%.3f,%.0f,%.0f,%lu\n", SWEEP_MG_PER_LSB, CHIRP_F0, CHIRP_F1,
+                  (unsigned long)(CHIRP_NBLK * TDM_BLOCK_FRAMES * 1000UL / TDM_RATE));
+}
+
+static void chirpStreamTick()
+{
+    imuFifoDrain();
+    int fit[4], nfit;
+    int nmodes = chirpModes(fit, nfit);
+    char label[8];
+    if (g_cs_mode < nfit)
+        snprintf(label, sizeof(label), "%d", fit[g_cs_mode] + 1);
+    else
+        snprintf(label, sizeof(label), "%d+%d", fit[0] + 1, fit[1] + 1);
+    uint32_t now = millis();
+    if (!g_cs_in_chirp)
+    {
+        if (now - g_cs_t >= CHIRP_GAP_MS)
+        {
+            float a[4] = {0, 0, 0, 0};
+            if (g_cs_mode < nfit)
+                a[fit[g_cs_mode]] = g_amp_level;
+            else
+                a[fit[0]] = a[fit[1]] = g_amp_level;
+            for (int i = 0; i < 4; i++)
+                g_freq[i] = CHIRP_F0;
+            g_chirp_blk = 0;
+            g_chirp_on = true;
+            ampTargets(a[0], a[1], a[2], a[3]);
+            g_cs_in_chirp = true;
+            Serial.printf("$cs,%s,%lu\n", label, (unsigned long)(g_xl_count + imuFifoUnreadWords() / 3));
+        }
+    }
+    else if (g_chirp_blk >= CHIRP_NBLK)
+    {
+        ampTargets(0, 0, 0, 0);
+        g_chirp_on = false;
+        g_cs_in_chirp = false;
+        g_cs_t = now;
+        Serial.printf("$ce,%s,%lu\n", label, (unsigned long)(g_xl_count + imuFifoUnreadWords() / 3));
+        g_cs_mode = (g_cs_mode + 1) % nmodes;
+    }
+    if (now - g_cs_ts >= 500)
+    {
+        g_cs_ts = now;
+        Serial.printf("$ts,%lu,%lld\n", (unsigned long)(g_xl_count + imuFifoUnreadWords() / 3),
+                      (long long)esp_timer_get_time());
+    }
+    g_haptic_on_since = now; // the stream manages its own on/off
+}
+
+// ── Constant vibration ('v', for companion/vibe_gui.py) ──────────────────────
+// "v<ch> <hz> <amp>\n": ch 1-4 holds a continuous tone, ch 0 stops. No 3 s auto-off, but the
+// host must repeat the command at least every HOLD_WATCHDOG_MS or the haptics are cut.
+// While holding, "$lv,<rms_mg>,<vsys>" is printed every 200 ms (IMU at 1.66 kHz, ±8 g).
+static constexpr uint32_t HOLD_WATCHDOG_MS = 1500;
+static int g_hold_ch = -1;
+static float g_hold_hz = 0, g_hold_amp = 0;
+static uint32_t g_hold_kick = 0;
+
+static void holdSet(int ch, float hz, float amp)
+{
+    if (ch < 0 || ch > 3)
+    {
+        if (g_hold_ch >= 0)
+        {
+            g_hold_ch = -1;
+            hapticStop();
+            if (g_imu_ok)
+                imuWrite8(0x10, 0x40); // CTRL1_XL back to 104 Hz, ±2 g
+            for (int i = 0; i < 4; i++)
+                g_freq[i] = CH_DEFAULT_HZ[i];
+            Serial.println("$hold,off");
+        }
+        return;
+    }
+    hz = fminf(fmaxf(hz, 10.0f), 1000.0f);
+    amp = fminf(fmaxf(amp, 0.0f), AMP_MAX);
+    g_hold_kick = millis();
+    if (ch == g_hold_ch && hz == g_hold_hz && amp == g_hold_amp)
+        return; // keepalive only
+    if (g_hold_ch < 0 && g_imu_ok)
+        imuWrite8(0x10, SWEEP_CTRL1_XL);
+    g_freq[ch] = hz;
+    hapticStart();
+    float a[4] = {0, 0, 0, 0};
+    a[ch] = amp;
+    ampTargets(a[0], a[1], a[2], a[3]);
+    g_hold_ch = ch;
+    g_hold_hz = hz;
+    g_hold_amp = amp;
+    Serial.printf("$hold,%d,%.1f,%.3f\n", ch + 1, hz, amp);
+}
+
+static void holdTick(uint32_t now)
+{
+    static uint32_t t_lv = 0;
+    if (g_hold_ch < 0)
+        return;
+    if (now - g_hold_kick > HOLD_WATCHDOG_MS)
+    {
+        Serial.println("# hold: no keepalive from host — haptics off");
+        holdSet(-1, 0, 0);
+        return;
+    }
+    g_haptic_on_since = now; // holding replaces the 3 s auto-off
+    if (g_imu_ok && now - t_lv >= 200)
+    {
+        t_lv = now;
+        float mg = imuVibRms(80, nullptr, SWEEP_MG_PER_LSB);
+        Serial.printf("$lv,%.1f,%.2f\n", mg, readVsys());
+    }
+}
+
 // Integer-only synthesis: the ESP32-C6 has no FPU, so per-sample sinf() for
 // 4 channels at 48 kHz starves every other task. 1024-entry table + Q32 phase
 // accumulator + Q15 amplitude with a linear ramp.
@@ -346,13 +937,40 @@ static void taskAudio(void *)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        if (g_chirp_on)
+        {
+            static const float k = logf(CHIRP_F1 / CHIRP_F0) / CHIRP_NBLK;
+            uint32_t b = g_chirp_blk;
+            float f = b >= CHIRP_NBLK ? CHIRP_F1 : CHIRP_F0 * expf(k * b);
+            for (int ch = 0; ch < 4; ch++)
+                g_freq[ch] = f;
+            g_chirp_blk = b + 1;
+        }
         uint32_t inc[4];
         int32_t tgt[4];
+        bool inv[4];
+        float amp_snap[4];
+        portENTER_CRITICAL(&g_amp_mux);
+        for (int ch = 0; ch < 4; ch++)
+            amp_snap[ch] = g_amp_target[ch];
+        portEXIT_CRITICAL(&g_amp_mux);
         for (int ch = 0; ch < 4; ch++)
         {
             inc[ch] = (uint32_t)(g_freq[ch] * 4294967296.0f / TDM_RATE); // one float op per block
-            tgt[ch] = (int32_t)(fminf(g_amp_target[ch], AMP_MAX) * 32767.0f);
+            tgt[ch] = (int32_t)(fminf(amp_snap[ch], AMP_MAX) * 32767.0f);
+            inv[ch] = g_ch_invert[ch];
         }
+        static ThreewayFilter filter;
+        static uint32_t filter_phase=0;
+        static int filter_sub=0;
+        static int16_t filter_prev[3]={},filter_next[3]={};
+        if(g_filter_reset) {
+            filter.reset(); filter_phase=0; filter_sub=0;
+            memset(filter_prev,0,sizeof(filter_prev)); memset(filter_next,0,sizeof(filter_next));
+            g_filter_reset=false;
+        }
+        const bool filter_on=g_filter_test;
+        const uint32_t filter_inc=(uint32_t)(g_filter_hz*4294967296.0f/2000.0f);
         for (int f = 0; f < TDM_BLOCK_FRAMES; f++)
         {
             int16_t *frame = &g_tdm_buf[f * TDM_SLOTS];
@@ -364,7 +982,20 @@ static void taskAudio(void *)
                 g_amp_q15[ch] = a;
                 if (a > 0)
                 {
-                    frame[ch] = (int16_t)(((int32_t)g_sine[g_phase_acc[ch] >> 22] * a) >> 15);
+                    int16_t smp = (int16_t)(((int32_t)g_sine[g_phase_acc[ch] >> 22] * a) >> 15);
+                    if(g_signature_sweep && ch==0 && smp<0)smp=0;
+                    if(g_characterize && ch==0 && g_char_shape!=16) {
+                        // Positive half-sine impacts, capped at 8ms per pulse.
+                        float phase=(float)g_phase_acc[ch]/4294967296.f;
+                        float width=fminf(.5f,g_freq[ch]*.008f);
+                        smp=(width>0&&phase<width)?(int16_t)(((int32_t)g_sine[(int)(phase/width*512.f)]*a)>>15):0;
+                        if(g_char_shape==32) {
+                            // Smooth offset sine, range [0,A], zero slope at return.
+                            int idx=((g_phase_acc[ch]>>22)+768)&1023;
+                            smp=(int16_t)(((int32_t)(32767+g_sine[idx])*a)>>16);
+                        }
+                    }
+                    frame[ch] = inv[ch] ? (int16_t)-smp : smp;
                     g_phase_acc[ch] += inc[ch];
                 }
                 else
@@ -373,7 +1004,21 @@ static void taskAudio(void *)
                     g_phase_acc[ch] = 0;
                 }
             }
-            frame[4] = frame[5] = frame[6] = frame[7] = 0;
+            if(filter_on) {
+                memset(frame,0,TDM_SLOTS*sizeof(int16_t));
+                if(filter_sub==0) {
+                    memcpy(filter_prev,filter_next,sizeof(filter_next));
+                    filter.process(g_sine[filter_phase>>22],filter_next);
+                    filter_phase+=filter_inc;
+                }
+                for(int ch=0;ch<3;++ch)
+                    frame[ThreewayCoefficients::kSlots[ch]]=filter_prev[ch]+((int32_t)(filter_next[ch]-filter_prev[ch])*(filter_sub+1))/24;
+                filter_sub=(filter_sub+1)%24;
+            }
+            if (g_slot_mirror && !filter_on) // diagnostic: HF signal also on slots 4..7 (catches amp slot mis-detect)
+                frame[4] = frame[5] = frame[6] = frame[7] = frame[2];
+            else
+                frame[4] = frame[5] = frame[6] = frame[7] = 0;
         }
         size_t written = 0;
         g_aud_err = i2s_channel_write(g_tx, g_tdm_buf, sizeof(g_tdm_buf), &written, pdMS_TO_TICKS(100));
@@ -427,7 +1072,15 @@ static void printHelp()
     Serial.println("#  r g b w  LED colour    0  LED off               c  LED auto (status breathing)");
     Serial.println("#  a        toggle 20 Hz accel/gyro stream");
     Serial.println("#  1 2 3 4  play test tone on LFi / MF / HF / LF   x  stop haptics");
-    Serial.println("#  + -      haptic amplitude ±0.05 FS (cap 0.25)   f  cycle tone freq 40→320 Hz");
+    Serial.println("#  t        actuator test: sweep fitted channels (LFi, HF), IMU pass/fail");
+    Serial.println("#  T        same, all four channels (finds actuators on the wrong connector)");
+    Serial.println("#  E        validate threeway FIR (input full scale, coefficient-limited outputs)");
+    Serial.println("#  W        full sweep 20-500 Hz, solo + paired in/anti-phase ($sw CSV, ~1 min)");
+    Serial.println("#  C        continuous chirp loop 20-500 Hz, raw accel stream (companion/chirp_view.py)");
+    Serial.println("#  y        diag: mirror HF onto TDM slots 4-7");
+    Serial.println("#  v<ch> <hz> <amp>  constant tone (repeat <1.5 s as keepalive), v0 = off (companion/vibe_gui.py)");
+    Serial.println("#  u        toggle USB input limit USB500 / USB100 (IO17)");
+    Serial.println("#  + -      haptic amplitude ±0.05 FS (cap 1.00)   f  cycle tone freq 40→320 Hz");
     Serial.println("#  p        blade rainbow  k  blade black frame   (needs boost + strip)");
     Serial.println("# ----------------------------------------------------------");
 }
@@ -445,10 +1098,21 @@ static void selfTest()
     Serial.printf("#  buttons MODE/GAIN/BOOT : %d/%d/%d  (1 = released)\n",
                   digitalRead(PIN_BTN_MODE), digitalRead(PIN_BTN_GAIN), digitalRead(PIN_BTN_BOOT));
     Serial.printf("#  IMU INT1 (IO2)    : %d  irq count=%lu\n", digitalRead(PIN_IMU_INT), (unsigned long)g_imu_irq_count);
-    Serial.printf("#  USB_500 (IO17)    : held LOW (USB100)\n");
+    Serial.printf("#  USB_500 (IO17)    : %d (%s)\n", (int)g_usb500, g_usb500 ? "USB500" : "USB100");
     Serial.printf("#  HAPTIC_EN (IO5)   : %d\n", digitalRead(PIN_HAPTIC_EN));
     Serial.printf("#  TDM channel       : %s  enable=%s  write=%s\n", g_tdm_ok ? "OK" : "FAIL",
                   esp_err_to_name(g_tdm_enable_err), esp_err_to_name(g_aud_err));
+    for (int ch = 0; ch < 4; ch++)
+    {
+        const ActResult &r = g_act[ch];
+        if (!CH_FITTED[ch] && !r.run)
+            Serial.printf("#  actuator %-11s: not fitted\n", CH_NAME[ch]);
+        else if (!r.run)
+            Serial.printf("#  actuator %-11s: not run (press t)\n", CH_NAME[ch]);
+        else
+            Serial.printf("#  actuator %-11s: %s  peak %.2f mg @ %.0f Hz, baseline %.2f mg\n", CH_NAME[ch],
+                          g_imu_ok ? (r.pass ? "OK" : "FAIL") : "not measured", r.best_mg, r.best_hz, r.base_mg);
+    }
     Serial.println("# ----------------------------------------------------------");
 }
 
@@ -461,7 +1125,7 @@ void setup()
     pinMode(PIN_HAPTIC_EN, OUTPUT);
     digitalWrite(PIN_HAPTIC_EN, LOW);
     pinMode(PIN_USB_500, OUTPUT);
-    digitalWrite(PIN_USB_500, LOW);
+    digitalWrite(PIN_USB_500, g_usb500 ? HIGH : LOW); // USB500 so full-amplitude haptics don't brown out
 
     pinMode(PIN_BTN_MODE, INPUT);  // external 100k pull-ups
     pinMode(PIN_BTN_GAIN, INPUT);
@@ -472,6 +1136,7 @@ void setup()
     digitalWrite(PIN_IMU_CS, HIGH);
 
     Serial.begin(115200);
+    Serial.setTimeout(50); // 'v' line commands
     {
         uint32_t t0 = millis();
         while (!Serial && millis() - t0 < 3000)
@@ -541,7 +1206,40 @@ static void handleCommand(char c)
     case 'c': g_led_auto = true; break;
     case 'a': g_accel_stream = !g_accel_stream; Serial.printf("# accel stream %s\n", g_accel_stream ? "on" : "off"); break;
     case '1': case '2': case '3': case '4': hapticPlay(c - '1'); break;
-    case 'x': hapticStop(); break;
+    case 'x': holdSet(-1, 0, 0); chirpStreamStop(); hapticStop(); break;
+    case 't': holdSet(-1, 0, 0); chirpStreamStop(); actuatorTest(); break;
+    case 'T': holdSet(-1, 0, 0); chirpStreamStop(); actuatorTest(true); break;
+    case 'E': holdSet(-1, 0, 0); chirpStreamStop(); filteredSweep(); break;
+    case 'W': holdSet(-1, 0, 0); chirpStreamStop(); sweepRun(); break;
+    case 'Q': {
+        String q=Serial.readStringUntil('\n');int mask=0,inv=0;float hz=0,amp=0,dur=0;
+        if(sscanf(q.c_str(),"%d %f %f %f %d",&mask,&hz,&amp,&dur,&inv)==5){holdSet(-1,0,0);chirpStreamStop();characterize(mask,hz,amp,dur,inv);}
+        else Serial.println("$err,parse");
+        break;
+    }
+    case 'B': holdSet(-1, 0, 0); chirpStreamStop(); g_signature_sweep=true; sweepRun(); g_signature_sweep=false; break;
+    case 'v':
+    {
+        String s = Serial.readStringUntil('\n');
+        int ch = 0;
+        float hz = 0, amp = 0;
+        if (sscanf(s.c_str(), "%d %f %f", &ch, &hz, &amp) >= 1)
+        {
+            chirpStreamStop();
+            holdSet(ch - 1, hz, amp);
+        }
+        break;
+    }
+    case 'C':
+        holdSet(-1, 0, 0);
+        if (g_cs_on) chirpStreamStop();
+        else chirpStreamStart();
+        break;
+    case 'u': usb500Set(!g_usb500); break;
+    case 'y':
+        g_slot_mirror = !g_slot_mirror;
+        Serial.printf("# slot mirror (HF also on slots 4-7): %s\n", g_slot_mirror ? "on" : "off");
+        break;
     case '+': case '=':
         g_amp_level = fminf(AMP_MAX, g_amp_level + AMP_STEP);
         Serial.printf("# amp=%.2f FS\n", g_amp_level);
@@ -578,6 +1276,15 @@ void loop()
 
     while (Serial.available())
         handleCommand((char)Serial.read());
+
+    if (g_cs_on)
+    {
+        chirpStreamTick();
+        delay(1);
+        return; // stream owns the serial port and the haptics
+    }
+
+    holdTick(millis());
 
     // Haptic auto-off
     // re-read millis(): g_haptic_on_since may have been set by handleCommand() above

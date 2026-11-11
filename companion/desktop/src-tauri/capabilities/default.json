@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Local device viewer events",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

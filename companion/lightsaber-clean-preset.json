@@ -1,0 +1,10 @@
+{
+  "levels": {
+    "LFi": 100,
+    "MF": 60,
+    "HF": 100,
+    "LF": 100
+  },
+  "confirmed_by_user": "No rattle at these levels",
+  "LFi_continuous_negative_cap": 0.35
+}

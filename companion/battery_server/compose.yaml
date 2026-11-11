@@ -1,0 +1,22 @@
+services:
+  battery-recorder:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "192.168.1.158:8086:8080"
+      - "192.168.1.158:9876:9876/udp"
+    volumes:
+      - battery-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  battery-data:
+

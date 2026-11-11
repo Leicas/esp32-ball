@@ -67,7 +67,23 @@ pio run -e a7_bringup --target upload --upload-port COM50
 pio device monitor -p COM50
 ```
 
-Pin map (from `esp32-ball-hardware/firmware-interface.md`, verified against `kicad/circuit.json` and on hardware 2026-10-07): PCA9632 handle RGB on I2C IO6/IO7 @0x62; LSM6DS3TR-C on SPI SCK=IO14 MOSI=IO15 MISO=IO18 CS=IO19 INT1=IO2 (WHO_AM_I reads **0x6A**); VSYS ADC IO4 (÷2); USB_GOOD_N IO3; buttons MODE=IO0 GAIN=IO1 BOOT=IO9; HAPTIC_EN IO5; TDM BCLK=IO21 FS=IO22 DATA=IO23 to four MAX98357A (48 kHz, 8×16-bit slots, slot 0..3 = LFi/MF/HF/LF); blade pixels IO20. Serial commands: `?` help, `s` self-test, `m` IMU probe, `r g b w 0 c` LED, `a` accel stream, `1`–`4` tone per channel (auto-off 3 s, amplitude capped at 0.25 FS), `x` stop, `+`/`-` amplitude, `f` frequency, `p`/`k` blade rainbow/black.
+Pin map (from `esp32-ball-hardware/firmware-interface.md`, verified against `kicad/circuit.json` and on hardware 2026-10-07): PCA9632 handle RGB on I2C IO6/IO7 @0x62; LSM6DS3TR-C on SPI SCK=IO14 MOSI=IO15 MISO=IO18 CS=IO19 INT1=IO2 (WHO_AM_I reads **0x6A**); VSYS ADC IO4 (÷2); USB_GOOD_N IO3; buttons MODE=IO0 GAIN=IO1 BOOT=IO9; HAPTIC_EN IO5; TDM BCLK=IO21 FS=IO22 DATA=IO23 to four MAX98357A (48 kHz, 8×16-bit slots, slot 0..3 = LFi/MF/HF/LF); blade pixels IO20. Serial commands: `?` help, `s` self-test, `m` IMU probe, `r g b w 0 c` LED, `a` accel stream, `1`–`4` tone per channel (auto-off 3 s, amplitude capped at 0.25 FS), `t` actuator test (sweeps the fitted channels — currently LFi and HF, see `CH_FITTED` — 50–320 Hz and reports PASS/FAIL from IMU vibration RMS at 1.66 kHz vs a silent baseline; result also shown in `s`), `T` same on all four channels, `W` full 20–500 Hz lock-in sweep (solo + pair in/anti-phase, IMU at ±8 g; driven by `companion/actuator_sweep.py COM6 --amp 0.10`, which writes response/crossover plots, `crossover_table.h` and a report to `companion/sweeps/<run>/`), `C` continuous chirp loop (20→500 Hz in 6 s on each fitted channel, then both; raw accel streamed from the IMU FIFO — view live with `companion/chirp_view.py COM6 --amp 0.10`, add `--seconds N --headless` to just capture), `y` diag: mirror HF onto TDM slots 4–7, `v<ch> <hz> <amp>\n` constant tone with no auto-off (host must repeat within 1.5 s or it cuts out; prints `$lv,<rms_mg>,<vsys>` at 5 Hz; `v0` stops) — GUI: `.venv/Scripts/python companion/vibe_gui.py [COM6]`, `u` toggle USB500/USB100 input limit (USB500 by default — USB100 browns out at 0.25 FS), `x` stop, `+`/`-` amplitude, `f` frequency, `p`/`k` blade rainbow/black.
+
+### `a7_ball` — rolling ball / marbles on the A7 board (`-DA7_BOARD`)
+
+Same `main.cpp` / physics / marbles / comms as the Feather and H-bridge targets; A7 backends in `imu.cpp`, `haptic.cpp` and `main.cpp` (`#if defined(A7_BOARD)`), pins and levels in `config.h`.
+
+- IMU: LSM6DS3TR-C over SPI at 833 Hz (±4 g, 500 dps) fused with a Mahony filter into the same outputs as the BNO085 reports (gravity, `imu_sin_alpha`, linear accel, quaternion). Gyro bias and initial attitude are taken at boot — **keep the board still for ~0.5 s after reset**. Tube axis = IMU Y, along the board (`A7_TUBE_AXIS` / `A7_TUBE_SIGN`).
+- Haptics: TDM 48 kHz, 48 frames per 1 ms physics tick (ramped). TacHammer Drake drive plan: wall/marble impacts = positive pulse on LFi (slot 0, "tick" into the impact end, ≤ 9 ms, `A7_IMPACT_FS` 0.25 with 1 ms raised-cosine edges — 0.40 FS square ticks browned out on USB power), rolling rumble = negative arch on LFi (`A7_ROLL_FS` 0.25, away from the end stop), rolling texture on HF (slot 2, DC-free, `A7_HF_ROLL_FS` 0.20).
+- UI: MODE button cycles ROLLING → SLIDING → MARBLES; GAIN cycles intensity 0.4 / 0.7 / 1.0. Handle RGB: green rolling / blue sliding / magenta marbles, brighter with ball speed, white flash on impacts; 3 red blinks at boot = the last reset was a brownout (persistent count in the `# up_s=… brownouts=N` status line). Serial/BLE protocol unchanged, so `companion/visualizer.py` works as-is.
+
+```bash
+pio run -e a7_ball --target upload --upload-port COM6
+```
+
+### Music player (separate repo)
+
+The Squeezebox / Music Assistant haptic player for the A7 board lives in `D:\dev\esp32ball\a7-music` (its own git repo). Note that its `custom_sdkconfig` rebuilds the *shared* Arduino framework libs: building an env here afterwards restores the stock libs (~4 min first build).
 
 ## Toolchain Notes
 

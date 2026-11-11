@@ -1,5 +1,6 @@
 #pragma once
 #include "config.h"
+#include <stdint.h>
 
 struct Marble
 {
@@ -8,12 +9,24 @@ struct Marble
     float r;    // radius [m]
 };
 
-// All marble positions and velocities (written by physics task)
+// Capacity is MARBLE_COUNT; only [0, marblesCount()) contains active balls.
 extern Marble g_marbles[MARBLE_COUNT];
 
-// Reset marble positions to a 3×2×1 grid; zero velocities.
-void marblesInit();
+// Seeded, non-overlapping placement. count is clamped to [0, MARBLE_COUNT].
+// Defaults preserve the original three-ball call sites.
+void marblesInit(int count = MARBLE_DEFAULT_COUNT, uint32_t seed = 1);
+int marblesCount();
 
-// Advance by dt seconds under acceleration (m/s²) and gravity (m/s²).
-// Returns the maximum impact speed seen this tick [m/s].
-float marblesStep(float dt, float accel_x_mps2, float accel_y_mps2, float accel_z_mps2, float grav_z_mps2);
+// Advance by dt seconds under body-frame gravity and box linear acceleration.
+// Gravity uses the IMU body axes; level gravity is +Z (down).
+// Returns summed wall impulse plus a reduced inter-ball cue [relative-mass · m/s].
+float marblesStep(float dt,
+                  float grav_x_mps2, float grav_y_mps2, float grav_z_mps2,
+                  float accel_x_mps2, float accel_y_mps2, float accel_z_mps2);
+
+// Mass-weighted RMS tangential speed while touching the box [m/s]. Free-flight
+// velocity is excluded; normal impacts use the separate impact haptic path.
+float marblesContactSpeed();
+
+// Telemetry-only impact peak hold/decay (~25 ms); never feed this back to haptics.
+float marblesImpactEnvelopeStep(float current, float impact_momentum, float dt);

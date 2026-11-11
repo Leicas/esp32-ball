@@ -1,6 +1,22 @@
 #pragma once
 
-enum class SimMode { ROLLING, SLIDING, MARBLES };
+enum class SimMode { SLIDING = 1, MARBLES = 2, TEXTURED = 3, LIGHTSABER = 4,
+                     ROLLING = 5, RAIN = 6 };
+
+inline bool isRollingMode(SimMode mode)
+{
+    return mode == SimMode::ROLLING || mode == SimMode::TEXTURED;
+}
+
+inline const char *simModeName(SimMode mode)
+{
+    return mode == SimMode::RAIN ? "RAINSTICK"
+         : mode == SimMode::ROLLING ? "ROLLING_BALL"
+         : mode == SimMode::LIGHTSABER ? "LIGHTSABER"
+         : mode == SimMode::TEXTURED ? "TEXTURED_SLIDE"
+         : mode == SimMode::SLIDING ? "SLIDING"
+         : "MARBLES";
+}
 
 struct ImpactInfo {
     bool  hit;
@@ -25,5 +41,5 @@ extern volatile float phys_x_vel; // [m/s]
 // ── Runtime-adjustable parameters ────────────────────────────────────────────
 // Written by comms task. Read by physics task.
 extern volatile float   g_cavity;    // virtual tube length [m]
-extern volatile SimMode g_sim_mode;  // ROLLING or SLIDING
+extern volatile SimMode g_sim_mode;  // classic/textured rolling, sliding, or marbles
 extern volatile bool    g_rebound;   // enable/disable bounce

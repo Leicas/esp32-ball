@@ -8,3 +8,11 @@ bis/
 .vscode/launch.json
 .vscode/settings.json
 .vscode/ipch
+companion/__pycache__/
+companion/desktop/node_modules/
+companion/desktop/dist/
+companion/desktop/src-tauri/target/
+companion/desktop/src-tauri/gen/
+companion/desktop/*.tsbuildinfo
+# Embedded reference recordings: local only (see src/lightsaber_samples_stub.h)
+src/lightsaber_samples.h
